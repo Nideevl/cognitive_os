@@ -1,0 +1,9 @@
+.env
+*.env
+__pycache__/
+*/__pycache__/
+*.pyc
+.key_pointer.json
+.agent_memory/
+.vscode/
+.idea/
