@@ -9,10 +9,11 @@ from agent.key_manager import GroqKeyRotator
 from engine.ast_indexer import ASTIndexer
 
 MAX_TOOL_CHARS = 15000       # cap on any single tool result fed to a worker
-MAX_WORKER_TURNS = 8
+MAX_WORKER_TURNS = 12   
 MAX_ROUNDS = 3
-MAX_WORKERS_PER_ROUND = 6
+MAX_WORKERS_PER_ROUND = 8
 MAX_GREP_HITS = 60
+MAX_FILES_PER_WORKER = 2
 
 TOOL_RE = re.compile(r"TOOL:\s*(\w+)\(([^)]*)\)")
 WRITE_RE = re.compile(
@@ -22,26 +23,29 @@ WRITE_RE = re.compile(
 TOOL_NAMES = ("read_file", "get_file_skeleton", "list_files", "grep_files")
 
 
-def parse_tool_call(msg: str):
-    """Return (name, arg) from any tool-call format, else None."""
-    m = re.search(r"TOOL:\s*(\w+)\(([^)]*)\)", msg)
-    if m and m.group(1) in TOOL_NAMES:
-        return m.group(1), m.group(2).strip().strip("'\"")
+def parse_tool_calls(msg: str, limit: int = 4):
+    """Return a list of (name, arg) from any tool-call format."""
+    calls = []
+    for m in re.finditer(r"TOOL:\s*(\w+)\(([^)]*)\)", msg):
+        if m.group(1) in TOOL_NAMES:
+            calls.append((m.group(1), m.group(2).strip().strip("'\"")))
+    if calls:
+        return calls[:limit]
 
-    if "<tool_call>" in msg or "<function" in msg or "TOOL:" in msg:
-        hits = [(msg.find(n), n) for n in TOOL_NAMES if n in msg]
-        if hits:
-            _, name = min(hits)
-            tail = msg[msg.find(name) + len(name):]
+    if looks_like_tool_markup(msg):
+        seen = set()
+        for m in re.finditer(r"\b(" + "|".join(TOOL_NAMES) + r")\b", msg):
+            name = m.group(1)
+            tail = msg[m.end():]
             if name == "grep_files":
-                g = re.match(r"\W*?([^<\n]+?)\s*(?:</|\)|\n|$)", tail)
-                arg = g.group(1) if g else ""
+                g = re.match(r"[^\w\\/.^(\[]*([^<\n]+?)\s*(?:</|\)|\n|$)", tail)
             else:
                 g = re.match(r"[^\w./\\-]*([\w./\\-]+)", tail)
-                arg = g.group(1) if g else ""
-            return name, arg.strip().strip("'\"")
-    return None
-
+            arg = g.group(1).strip().strip("'\"") if g else ""
+            if arg and (name, arg) not in seen:
+                seen.add((name, arg))
+                calls.append((name, arg))
+    return calls[:limit]
 
 def looks_like_tool_markup(msg: str) -> bool:
     return any(s in msg for s in ("<tool_call>", "<function", "TOOL:"))
@@ -197,18 +201,22 @@ class DeveloperAgent:
 
     # ------------------------------------------------------------------ tools
 
-    def _resolve(self, name: str) -> Tuple[Optional[Path], Optional[str]]:
-        name = name.strip().strip("'\"").replace("\\", "/")
+    def _resolve(self, name: str, fuzzy: bool = True) -> Tuple[Optional[Path], Optional[str]]:
+        name = name.strip().strip("'\"").replace("\\", "/").lstrip("/")
         if not name:
             return None, "Error: empty file name."
 
-        direct = (self.root / name)
-        if direct.is_file():
-            return direct, None
+        # paths may be repo-relative or service-relative
+        bases = [self.root] + [self.root / s for s in sorted(self.target_services)]
+        for b in bases:
+            if (b / name).is_file():
+                return b / name, None
 
         matches = self.file_index.get(Path(name).name.lower(), [])
         if "/" in name:
-            matches = [m for m in matches if self._rel(m).lower().endswith(name.lower())]
+            narrowed = [m for m in matches if self._rel(m).lower().endswith(name.lower())]
+            # models often guess wrong folder names; fall back to filename (reads only)
+            matches = narrowed if (narrowed or not fuzzy) else matches
 
         if len(matches) == 1:
             return matches[0], None
@@ -219,7 +227,7 @@ class DeveloperAgent:
             opts = ", ".join(self._rel(m) for m in matches)
             return None, f"Ambiguous '{name}'. Use one of: {opts}"
         return None, f"Error: File '{name}' not found in repo."
-
+    
     def read_file(self, file_name: str) -> str:
         path, err = self._resolve(file_name)
         if err:
@@ -242,18 +250,20 @@ class DeveloperAgent:
             return f"Error: {e}"
 
     def list_files(self, directory: str = "") -> str:
-        directory = directory.strip().strip("'\"").replace("\\", "/")
-        base = (self.root / directory) if directory else self.root
-        if not base.is_dir():
-            return f"Error: directory '{directory}' not found."
+        directory = directory.strip().strip("'\"").replace("\\", "/").lstrip("/")
+        bases = [self.root / directory] if directory else [self.root]
+        if directory:
+            bases += [self.root / s / directory for s in sorted(self.target_services)]
+        base = next((b for b in bases if b.is_dir()), None)
+        if base is None:
+            return (f"Error: directory '{directory}' not found. "
+                    f"Services: {', '.join(self.list_services())}")
         files = []
         for p in sorted(base.rglob("*.java")):
             if "test" in p.parts or "target" in p.parts:
                 continue
             files.append(self._rel(p))
-        if not files:
-            return "(no java files)"
-        return self._cap("\n".join(files))
+        return self._cap("\n".join(files)) if files else "(no java files)"
 
     def grep_files(self, pattern: str) -> str:
         pattern = pattern.strip().strip("'\"")
@@ -288,13 +298,16 @@ class DeveloperAgent:
         return "\n".join(hits) if hits else "(no matches)"
 
     def write_file(self, file_name: str, content: str) -> str:
-        path, err = self._resolve(file_name)
+        path, err = self._resolve(file_name, fuzzy=False)
         if err:
             if err.startswith("Ambiguous"):
                 return err
-            rel = file_name.strip().replace("\\", "/")
+            rel = file_name.strip().replace("\\", "/").lstrip("/")
             if "/" not in rel:
                 return f"ERROR: '{file_name}' does not exist. Give a repo-relative path to create it."
+            first = rel.split("/", 1)[0]
+            if first not in self.list_services() and len(self.target_services) == 1:
+                rel = f"{next(iter(self.target_services))}/{rel}"
             path = (self.root / rel).resolve()
         else:
             path = path.resolve()
@@ -417,7 +430,7 @@ match the codebase. Write complete files only, never fragments."""
 
         system_prompt = f"""You are Worker {worker_id}, a focused sub-agent working inside a code repository.
 
-TOOLS (call at most one per message, on its own line):
+TOOLS (you may call up to 4 per message, one per line):
 - TOOL: read_file(filename_or_relative_path)
 - TOOL: get_file_skeleton(filename_or_relative_path)
 - TOOL: list_files(directory)   (directory relative to repo root, blank for all)
@@ -443,6 +456,8 @@ RULES:
         actions: List[str] = []
         final = ""
         finished = False
+        partial = False
+        seen = set()
 
         for _ in range(MAX_WORKER_TURNS):
             msg = self._chat(messages, max_tokens=3000)
@@ -459,23 +474,30 @@ RULES:
                 messages.append({"role": "user", "content": f"TOOL RESULT:\n{result}"})
                 continue
 
-            call = parse_tool_call(msg)
-            if call:
-                name, arg = call
-                if name == "read_file":
-                    result = self.read_file(arg)
-                elif name == "get_file_skeleton":
-                    result = self.get_file_skeleton(arg)
-                elif name == "list_files":
-                    result = self.list_files(arg)
-                else:
-                    result = self.grep_files(arg)
-                messages.append({"role": "user", "content": f"TOOL RESULT:\n{result}"})
+            calls = parse_tool_calls(msg)
+            if calls:
+                outs = []
+                for name, arg in calls:
+                    key = (name, arg.lower())
+                    if key in seen:
+                        outs.append(f"[{name}({arg})] already returned above; do not repeat it.")
+                        continue
+                    seen.add(key)
+                    if name == "read_file":
+                        result = self.read_file(arg)
+                    elif name == "get_file_skeleton":
+                        result = self.get_file_skeleton(arg)
+                    elif name == "list_files":
+                        result = self.list_files(arg)
+                    else:
+                        result = self.grep_files(arg)
+                    outs.append(f"[{name}({arg})]\n{result}")
+                messages.append({"role": "user", "content": "TOOL RESULT:\n" + "\n\n".join(outs)})
                 continue
 
             if looks_like_tool_markup(msg):
                 messages.append({"role": "user", "content":
-                    "TOOL ERROR: could not parse that call. Use exactly one line: "
+                    "TOOL ERROR: could not parse that call. Use one line per call: "
                     "TOOL: read_file(path/to/File.java)"})
                 continue
 
@@ -483,7 +505,19 @@ RULES:
             break
 
         if not finished:
-            final += "\n\n[worker hit turn limit before finishing]"
+            # budget exhausted: force a report from what was already read
+            messages.append({"role": "user", "content":
+                "Tool budget exhausted. Write your final report NOW from what you already read. "
+                "Include actual code/signatures. NO tool calls."})
+            msg = self._chat(messages, max_tokens=3000)
+            if msg and not looks_like_tool_markup(msg):
+                final = msg + "\n\n[partial: turn budget hit]"
+                partial = True
+            else:
+                final += "\n\n[worker hit turn limit before finishing]"
+
+        status = "COMPLETED" if finished else ("PARTIAL" if partial else "INCOMPLETE")
+        report = ChildReport(worker_id, task, final, status)   
         if actions:
             final += "\n\nACTIONS: " + "; ".join(actions)
 
@@ -499,20 +533,26 @@ RULES:
         workers = []
         if not isinstance(raw, list):
             return workers
-        for w in raw[:MAX_WORKERS_PER_ROUND]:
+        for w in raw:
             if not isinstance(w, dict) or not w.get("task"):
                 continue
             files = w.get("files", "")
             if isinstance(files, list):
                 files = ", ".join(str(f) for f in files)
-            workers.append(
-                {
-                    "task": str(w["task"]),
-                    "files": str(files),
-                    "write": bool(w.get("write", False)),
-                }
-            )
-        return workers
+            write = bool(w.get("write", False))
+            flist = [f.strip() for f in re.split(r"[,\n]", str(files)) if f.strip()]
+            if not write and len(flist) > MAX_FILES_PER_WORKER:
+                for i in range(0, len(flist), MAX_FILES_PER_WORKER):
+                    chunk = flist[i:i + MAX_FILES_PER_WORKER]
+                    workers.append({
+                        "task": f"{w['task']}\n(Focus ONLY on: {', '.join(chunk)}. "
+                                f"Report the actual contents/signatures you found.)",
+                        "files": ", ".join(chunk),
+                        "write": False,
+                    })
+            else:
+                workers.append({"task": str(w["task"]), "files": str(files), "write": write})
+        return workers[:MAX_WORKERS_PER_ROUND]
 
     def create_intelligent_plan(self, user_question: str) -> List[dict]:
         self.frame.global_intent = user_question
@@ -530,6 +570,9 @@ Grant "write": true only to workers whose task is to create or modify files, and
 If the goal only asks for analysis or explanation, use read-only workers.
 If the goal needs changes, first use read-only workers to gather what is needed; later rounds will handle edits.
 Do not assume anything about files you have not been shown; have workers verify.
+
+HARD LIMIT: each worker gets at most 2 files. If a task needs more files, split it into several workers.
+Use file paths exactly as shown in the facts (relative to the service folder). Never guess folder names.
 
 Respond with ONLY a JSON object:
 {
@@ -596,6 +639,10 @@ If a write happened, check the report's readback/warnings; if something is wrong
 If more information is needed, or edits/fixes/verification remain, schedule workers (same rules: narrow tasks, "write": true only for file modification).
 Pass worker tasks all the specifics they need (exact signatures, paths, package names) because they do not see other reports.
 
+HARD LIMIT: each worker gets at most 2 files. If a task needs more files, split it into several workers.
+Use file paths exactly as shown in the facts (relative to the service folder). Never guess folder names.
+
+If a worker is INCOMPLETE or PARTIAL, do NOT repeat its task. Split it into smaller tasks of at most 2 files each, using the exact paths from the reports.
 Respond with ONLY a JSON object:
 {
 "summary": "concise factual state: what was found, what was done, what remains",
