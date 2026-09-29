@@ -8,8 +8,10 @@ from datetime import datetime
 from agent.key_manager import GroqKeyRotator
 from engine.ast_indexer import ASTIndexer
 
-MAX_TOOL_CHARS = 15000       # cap on any single tool result fed to a worker
-MAX_WORKER_TURNS = 12   
+MAX_TOOL_CHARS = 6000
+MAX_CONTEXT_CHARS = 16000   # ~4.5k tokens, stays under the 7k/min input limit
+MAX_OUT_TOKENS = 1000       # some keys allow only 1000 output tokens/min
+MAX_WORKER_TURNS = 12
 MAX_ROUNDS = 3
 MAX_WORKERS_PER_ROUND = 8
 MAX_GREP_HITS = 60
@@ -20,8 +22,10 @@ WRITE_RE = re.compile(
     r"WRITE_FILE:\s*(\S+)[ \t]*\r?\n```[\w+-]*\r?\n(.*?)\r?\n```",
     re.DOTALL,
 )
-TOOL_NAMES = ("read_file", "get_file_skeleton", "list_files", "grep_files")
-
+TOOL_NAMES = ("read_file", "get_file_skeleton", "list_files", "grep_files",
+              "replace_preview", "replace_all")
+TEXT_EXTS = {".java", ".xml", ".yml", ".yaml", ".properties", ".json", ".gradle", ".md", ".sql"}
+SKIP_DIRS = {"target", "build", ".git", ".idea", "node_modules", ".cognitive_backup"}
 
 def parse_tool_calls(msg: str, limit: int = 4):
     """Return a list of (name, arg) from any tool-call format."""
@@ -36,6 +40,8 @@ def parse_tool_calls(msg: str, limit: int = 4):
         seen = set()
         for m in re.finditer(r"\b(" + "|".join(TOOL_NAMES) + r")\b", msg):
             name = m.group(1)
+            if name in ("replace_preview", "replace_all"):
+                continue 
             tail = msg[m.end():]
             if name == "grep_files":
                 g = re.match(r"[^\w\\/.^(\[]*([^<\n]+?)\s*(?:</|\)|\n|$)", tail)
@@ -46,6 +52,7 @@ def parse_tool_calls(msg: str, limit: int = 4):
                 seen.add((name, arg))
                 calls.append((name, arg))
     return calls[:limit]
+
 
 def looks_like_tool_markup(msg: str) -> bool:
     return any(s in msg for s in ("<tool_call>", "<function", "TOOL:"))
@@ -139,6 +146,14 @@ class DeveloperAgent:
 
     # ------------------------------------------------------------------ infra
 
+    def _reset(self):
+        """Every question starts from zero: no frame, no reports, no synthesis, no target services."""
+        self.frame = WorkingFrame()
+        self.target_services = set()
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self._build_index()   # re-scan disk so files changed since the last question are seen
+
     def _build_index(self):
         self.file_index.clear()
         for p in self.root.rglob("*.java"):
@@ -199,6 +214,87 @@ class DeveloperAgent:
             return text
         return text[:MAX_TOOL_CHARS] + f"\n...[truncated, {len(text)} chars total]"
 
+    def _chat_json(self, messages, max_tokens: int = MAX_OUT_TOKENS):
+        """Returns (data, text). Retries once with a compact-output instruction if JSON is cut off."""
+        text = self._chat(messages, max_tokens=max_tokens)
+        data = self._extract_json(text)
+        if data is not None:
+            return data, text
+        retry = [dict(m) for m in messages]
+        retry[-1]["content"] += (
+            "\n\nYour previous reply was cut off or not valid JSON. Reply again with ONLY compact JSON: "
+            "at most 4 workers, each task under 25 words, files as short paths, no prose."
+        )
+        text = self._chat(retry, max_tokens=max_tokens)
+        return self._extract_json(text), text
+
+    def _text_files(self):
+        for p in self.root.rglob("*"):
+            if not p.is_file() or p.suffix.lower() not in TEXT_EXTS:
+                continue
+            try:
+                parts = p.relative_to(self.root).parts
+            except Exception:
+                continue
+            if any(part in SKIP_DIRS for part in parts):
+                continue
+            yield p
+
+    @staticmethod
+    def _split_pair(arg: str):
+        for sep in ("=>", "->", "|"):
+            if sep in arg:
+                a, b = arg.split(sep, 1)
+                return a.strip().strip("'\""), b.strip().strip("'\"")
+        return None, None
+
+    def replace_in_repo(self, arg: str, apply: bool) -> str:
+        """Deterministic repo-wide literal replace. apply=False is a dry run."""
+        old, new = self._split_pair(arg)
+        if not old or new is None or old == new:
+            return "ERROR: use  old => new"
+        if len(old) < 3:
+            return "ERROR: 'old' must be at least 3 characters."
+
+        backup_root = self.root / ".cognitive_backup" / datetime.now().strftime("%Y%m%d_%H%M%S")
+        changed, total, by_ext = [], 0, {}
+        for p in self._text_files():
+            try:
+                raw = p.read_bytes()
+                text = raw.decode("utf-8")
+            except Exception:
+                continue
+            n = text.count(old)
+            if not n:
+                continue
+            total += n
+            changed.append(self._rel(p))
+            by_ext[p.suffix.lower()] = by_ext.get(p.suffix.lower(), 0) + n
+            if apply:
+                bp = backup_root / p.relative_to(self.root)
+                bp.parent.mkdir(parents=True, exist_ok=True)
+                bp.write_bytes(raw)
+                p.write_bytes(text.replace(old, new).encode("utf-8"))
+
+        ext_s = ", ".join(f"{k}:{v}" for k, v in sorted(by_ext.items())) or "none"
+        sample = "\n".join(changed[:20]) + (f"\n...+{len(changed) - 20} more" if len(changed) > 20 else "")
+        head = "APPLIED" if apply else "PREVIEW (nothing written)"
+        out = f"{head}: '{old}' -> '{new}': {total} occurrence(s) in {len(changed)} file(s) [by type: {ext_s}]\n{sample}"
+
+        if apply:
+            self._build_index()
+            resid = []
+            for p in self._text_files():
+                try:
+                    if old.lower() in p.read_text(encoding="utf-8", errors="ignore").lower():
+                        resid.append(self._rel(p))
+                except Exception:
+                    pass
+            out += f"\nBackups: {self._rel(backup_root)}"
+            out += f"\nREMAINING case-insensitive matches of '{old}': {len(resid)} file(s) {resid[:10]}"
+            out += f"\nREPO OVERVIEW AFTER:\n{self._repo_overview()}"
+        return out
+
     # ------------------------------------------------------------------ tools
 
     def _resolve(self, name: str, fuzzy: bool = True) -> Tuple[Optional[Path], Optional[str]]:
@@ -227,7 +323,7 @@ class DeveloperAgent:
             opts = ", ".join(self._rel(m) for m in matches)
             return None, f"Ambiguous '{name}'. Use one of: {opts}"
         return None, f"Error: File '{name}' not found in repo."
-    
+
     def read_file(self, file_name: str) -> str:
         path, err = self._resolve(file_name)
         if err:
@@ -342,6 +438,43 @@ class DeveloperAgent:
 
     # --------------------------------------------------------------- topology
 
+    def _repo_overview(self) -> str:
+        lines = []
+        fmt = lambda d: ", ".join(f"{k}({v})" for k, v in sorted(d.items()))
+        for svc in self.list_services():
+            dirs, pkgs, n = {}, {}, 0
+            for p in (self.root / svc).rglob("*.java"):
+                if "test" in p.parts or "target" in p.parts:
+                    continue
+                n += 1
+                posix = p.as_posix()
+                if "src/main/java/" in posix:
+                    d = ".".join(posix.split("src/main/java/", 1)[1].split("/")[:2])
+                    dirs[d] = dirs.get(d, 0) + 1
+                try:
+                    head = p.read_text(encoding="utf-8", errors="ignore")[:600]
+                except Exception:
+                    continue
+                m = re.search(r"^\s*package\s+([\w.]+)\s*;", head, re.MULTILINE)
+                if m:
+                    k = ".".join(m.group(1).split(".")[:2])
+                    pkgs[k] = pkgs.get(k, 0) + 1
+            lines.append(f"- {svc}: {n} java files | folder roots: {fmt(dirs)} | package roots: {fmt(pkgs)}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _trim_history(messages) -> bool:
+        """Drop oldest tool results until the context fits the budget."""
+        total = lambda: sum(len(m["content"]) for m in messages)
+        trimmed = False
+        for m in messages[2:]:
+            if total() <= MAX_CONTEXT_CHARS:
+                break
+            if m["role"] == "user" and m["content"].startswith("TOOL RESULT:") and len(m["content"]) > 200:
+                m["content"] = "TOOL RESULT: [omitted to save tokens; re-run the tool if needed]"
+                trimmed = True
+        return trimmed
+
     def _extract_topology_facts(self, user_question: str) -> str:
         target_services = set()
         q = user_question.lower()
@@ -363,10 +496,9 @@ class DeveloperAgent:
         facts = [f"ALL SERVICES: {', '.join(all_services)}"]
 
         if not target_services:
-            facts.append(
-                "TARGET SERVICES: (not identified; workers should use list_files / grep_files "
-                "to locate relevant code)"
-            )
+            facts.append("TARGET SERVICES: (not identified)")
+            facts.append("REPO OVERVIEW (per service: java files | folder roots | declared package roots):")
+            facts.append(self._repo_overview())
             return "\n".join(facts)
 
         facts.append(f"TARGET SERVICES: {', '.join(sorted(target_services))}")
@@ -425,6 +557,7 @@ WRITE_FILE: <path or filename>
 ```<language>
 <full file content>
 ```
+- TOOL: replace_all(old => new)   (repo-wide literal replace in java/xml/yml/properties/json files; backs up originals; run replace_preview first and check the counts)
 Before writing, read neighbouring/related files so your package, imports, naming and style
 match the codebase. Write complete files only, never fragments."""
 
@@ -435,12 +568,13 @@ TOOLS (you may call up to 4 per message, one per line):
 - TOOL: get_file_skeleton(filename_or_relative_path)
 - TOOL: list_files(directory)   (directory relative to repo root, blank for all)
 - TOOL: grep_files(pattern)     (regex or literal; returns path:line: text){write_doc}
+- TOOL: replace_preview(old => new)   (repo-wide literal replace, DRY RUN: counts per file type, writes nothing)
 
 RULES:
 - Do only the assigned task. Read only what you need.
 - Base every claim on file contents you actually read; if something is missing or unclear, say so.
 - Finish with a complete, concrete report and NO tool call in that final message.
-- Tool calls must be written exactly as `TOOL: name(arg)`. Do not use XML/<tool_call> tags.
+- Tool calls must be written exactly as TOOL: name(arg). Do not use XML/<tool_call> tags.
 - Your final report must include the actual code/signatures you found, not a statement that you will read."""
 
         user_message = f"ASSIGNED FILES/SCOPE: {target_files or '(not specified)'}\n"
@@ -460,7 +594,9 @@ RULES:
         seen = set()
 
         for _ in range(MAX_WORKER_TURNS):
-            msg = self._chat(messages, max_tokens=3000)
+            if self._trim_history(messages):
+                seen.clear()
+            msg = self._chat(messages, max_tokens=MAX_OUT_TOKENS)
             messages.append({"role": "assistant", "content": msg})
             final = msg
 
@@ -489,6 +625,11 @@ RULES:
                         result = self.get_file_skeleton(arg)
                     elif name == "list_files":
                         result = self.list_files(arg)
+                    elif name == "replace_preview":
+                        result = self.replace_in_repo(arg, apply=False)
+                    elif name == "replace_all":
+                        result = (self.replace_in_repo(arg, apply=True) if can_write
+                                  else "ERROR: you do not have write permission.")
                     else:
                         result = self.grep_files(arg)
                     outs.append(f"[{name}({arg})]\n{result}")
@@ -509,7 +650,7 @@ RULES:
             messages.append({"role": "user", "content":
                 "Tool budget exhausted. Write your final report NOW from what you already read. "
                 "Include actual code/signatures. NO tool calls."})
-            msg = self._chat(messages, max_tokens=3000)
+            msg = self._chat(messages, max_tokens=MAX_OUT_TOKENS)
             if msg and not looks_like_tool_markup(msg):
                 final = msg + "\n\n[partial: turn budget hit]"
                 partial = True
@@ -517,17 +658,17 @@ RULES:
                 final += "\n\n[worker hit turn limit before finishing]"
 
         status = "COMPLETED" if finished else ("PARTIAL" if partial else "INCOMPLETE")
-        report = ChildReport(worker_id, task, final, status)   
         if actions:
             final += "\n\nACTIONS: " + "; ".join(actions)
 
-        report = ChildReport(worker_id, task, final, "COMPLETED" if finished else "INCOMPLETE")
+        report = ChildReport(worker_id, task, final, status)
         self.frame.child_reports.append(report)
         print(f"[Stack Pop <- {worker_id}]")
         print(f"  Findings: {final[:300]}...\n")
         return report
 
     # ----------------------------------------------------------- orchestration
+
     @staticmethod
     def _clean_workers(raw) -> List[dict]:
         workers = []
@@ -574,23 +715,29 @@ Do not assume anything about files you have not been shown; have workers verify.
 HARD LIMIT: each worker gets at most 2 files. If a task needs more files, split it into several workers.
 Use file paths exactly as shown in the facts (relative to the service folder). Never guess folder names.
 
+If the facts/overview already answer the goal, return "workers": [] and put the answer in "answer".
+Otherwise use the FEWEST workers possible. For repo-wide questions about a name, package or string, use ONE worker that calls grep_files. Never list every service.
+Keep the JSON compact: at most 4 workers, each task under 25 words, files as short paths.
+For repo-wide mechanical changes (renaming a package/word, replacing a string everywhere), use ONE write worker that runs replace_preview, then replace_all. Do NOT enumerate files or services.
+
 Respond with ONLY a JSON object:
 {
-"plan": "2-3 sentence strategy",
-"findings": "files/components from the facts that look relevant and why",
-"workers": [
-{"task": "specific instruction", "files": "comma-separated file names or scope", "write": false}
-]
+  "plan": "2-3 sentence strategy",
+  "findings": "files/components from the facts that look relevant and why",
+  "answer": "",
+  "workers": [
+    {"task": "specific instruction", "files": "comma-separated file names or scope", "write": false}
+  ]
 }"""
 
         user_message = f"{topology}\n\nUSER GOAL: {user_question}\n\nProduce the JSON plan."
 
-        text = self._chat(
+        data, text = self._chat_json(
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
-            max_tokens=1200,
+            max_tokens=MAX_OUT_TOKENS,
         )
         data = self._extract_json(text)
 
@@ -599,8 +746,14 @@ Respond with ONLY a JSON object:
             self.frame.findings = str(data.get("findings", ""))
             workers = self._clean_workers(data.get("workers"))
         else:
-            self.frame.plan = text
+            self.frame.plan = "(planner returned no valid JSON)"
             workers = []
+
+        answer = str(data.get("answer", "")).strip() if data else ""
+        if answer and not workers:
+            self.frame.synthesis = answer
+            self.frame.awareness_state = "ANSWERED"
+            return []
 
         if not workers:
             workers = [
@@ -643,11 +796,12 @@ HARD LIMIT: each worker gets at most 2 files. If a task needs more files, split 
 Use file paths exactly as shown in the facts (relative to the service folder). Never guess folder names.
 
 If a worker is INCOMPLETE or PARTIAL, do NOT repeat its task. Split it into smaller tasks of at most 2 files each, using the exact paths from the reports.
+
 Respond with ONLY a JSON object:
 {
-"summary": "concise factual state: what was found, what was done, what remains",
-"status": "DONE" or "CONTINUE",
-"workers": [ {"task": "...", "files": "...", "write": false} ]
+  "summary": "concise factual state: what was found, what was done, what remains",
+  "status": "DONE" or "CONTINUE",
+  "workers": [ {"task": "...", "files": "...", "write": false} ]
 }
 Use an empty workers list when status is DONE."""
 
@@ -661,16 +815,14 @@ Use an empty workers list when status is DONE."""
             f"{prior}LATEST WORKER REPORTS:\n{reports_text}\n\nProduce the JSON decision."
         )
 
-        text = self._chat(
+        data, text = self._chat_json(
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
-            ],
-            max_tokens=2500,
+            ]
         )
-        data = self._extract_json(text)
         if not data:
-            self.frame.synthesis = text
+            self.frame.synthesis = "Synthesis failed (no valid JSON). See worker reports above."
             return {"status": "DONE", "workers": []}
 
         self.frame.synthesis = str(data.get("summary", text))
@@ -708,7 +860,12 @@ Use an empty workers list when status is DONE."""
         return True
 
     def execute_plan(self, user_question: str) -> str:
+        self._reset()
         workers = self.create_intelligent_plan(user_question)
+        if not workers:
+            print(self.frame.render())
+            self.save_session()
+            return self.frame.synthesis
 
         for rnd in range(1, MAX_ROUNDS + 1):
             self.frame.awareness_state = f"EXECUTING_ROUND_{rnd}"

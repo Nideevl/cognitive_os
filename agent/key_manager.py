@@ -98,9 +98,12 @@ class GroqKeyRotator:
         while attempts < max_total_attempts:
             client = self.get_current_client()
             try:
-                # Always persist the active slot being used
+                client = self.get_current_client()
+                result = call_fn(client)
+                # Success: move to the next key so the NEXT call uses a fresh one
+                self.current_idx = (self.current_idx + 1) % len(self.keys)
                 self._persist_index(self.current_idx)
-                return call_fn(client)
+                return result
 
             except Exception as e:
                 err_msg = str(e).lower()
