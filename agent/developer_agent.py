@@ -1,114 +1,145 @@
 import re
 import json
-import hashlib
 from pathlib import Path
-from typing import Dict, List, Any, Optional
-from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from datetime import datetime
 
 from agent.key_manager import GroqKeyRotator
 from engine.ast_indexer import ASTIndexer
-from protocols.messages import FrameSpawnRequest, FrameReturnPacket
+
+MAX_TOOL_CHARS = 15000       # cap on any single tool result fed to a worker
+MAX_WORKER_TURNS = 8
+MAX_ROUNDS = 3
+MAX_WORKERS_PER_ROUND = 6
+MAX_GREP_HITS = 60
+
+TOOL_RE = re.compile(r"TOOL:\s*(\w+)\(([^)]*)\)")
+WRITE_RE = re.compile(
+    r"WRITE_FILE:\s*(\S+)[ \t]*\r?\n```[\w+-]*\r?\n(.*?)\r?\n```",
+    re.DOTALL,
+)
+TOOL_NAMES = ("read_file", "get_file_skeleton", "list_files", "grep_files")
 
 
-# =====================================================================
-# WORKING FRAME (Cognitive State Dashboard)
-# =====================================================================
+def parse_tool_call(msg: str):
+    """Return (name, arg) from any tool-call format, else None."""
+    m = re.search(r"TOOL:\s*(\w+)\(([^)]*)\)", msg)
+    if m and m.group(1) in TOOL_NAMES:
+        return m.group(1), m.group(2).strip().strip("'\"")
+
+    if "<tool_call>" in msg or "<function" in msg or "TOOL:" in msg:
+        hits = [(msg.find(n), n) for n in TOOL_NAMES if n in msg]
+        if hits:
+            _, name = min(hits)
+            tail = msg[msg.find(name) + len(name):]
+            if name == "grep_files":
+                g = re.match(r"\W*?([^<\n]+?)\s*(?:</|\)|\n|$)", tail)
+                arg = g.group(1) if g else ""
+            else:
+                g = re.match(r"[^\w./\\-]*([\w./\\-]+)", tail)
+                arg = g.group(1) if g else ""
+            return name, arg.strip().strip("'\"")
+    return None
+
+
+def looks_like_tool_markup(msg: str) -> bool:
+    return any(s in msg for s in ("<tool_call>", "<function", "TOOL:"))
+
+
 @dataclass
-class SubGoal:
-    description: str
-    status: str = "PENDING"        # PENDING | ACTIVE | DONE | INVALIDATED
-    file_name: Optional[str] = None
-
-
-@dataclass
-class RevisionEntry:
-    file_name: str
-    snapshot_hash: str
-    reason: str
+class ChildReport:
+    worker_id: str
+    task: str
+    findings: str
+    status: str
 
 
 @dataclass
 class WorkingFrame:
     global_intent: str = ""
-    working_hypothesis: str = ""
-    active_sub_goal: Optional[str] = None
-    sub_goal_stack: List[SubGoal] = field(default_factory=list)
-    revision_ledger: List[RevisionEntry] = field(default_factory=list)
-    awareness_state: str = "ORIENT"   # ORIENT | PINPOINT | MUTATE | PROPAGATE | BACKTRACK
-    last_action: str = "(none yet)"
+    plan: str = ""
+    findings: str = ""
+    next_tasks: str = ""
+    synthesis: str = ""
+    child_reports: List[ChildReport] = None
+    awareness_state: str = "PLANNING"
+
+    def __post_init__(self):
+        if self.child_reports is None:
+            self.child_reports = []
 
     def render(self) -> str:
-        live_lines = []
-        for sg in self.sub_goal_stack:
-            if sg.status in ("PENDING", "ACTIVE"):
-                marker = "[ACTIVE]" if sg.status == "ACTIVE" else "[PENDING]"
-                file_suffix = f"  ({sg.file_name})" if sg.file_name else ""
-                live_lines.append(f"   - {marker} {sg.description}{file_suffix}")
-        live_str = "\n".join(live_lines) if live_lines else "   (empty)"
+        reports_str = ""
+        if self.child_reports:
+            reports_str = "\nCHILD REPORTS:\n"
+            for r in self.child_reports:
+                reports_str += f"  [{r.worker_id}] {r.status}\n{r.findings}\n\n"
 
-        ledger_lines = [
-            f"   - {e.file_name} @ {e.snapshot_hash[:8]} — {e.reason}"
-            for e in self.revision_ledger[-5:]
-        ]
-        ledger_str = "\n".join(ledger_lines) if ledger_lines else "   (no mutations yet)"
+        synthesis_str = ""
+        if self.synthesis:
+            synthesis_str = f"\nLATEST SYNTHESIS:\n{self.synthesis}\n"
 
         return (
-            "=== WORKING FRAME ===\n"
-            f"INTENT      : {self.global_intent or '(unset)'}\n"
-            f"ACTIVE GOAL : {self.active_sub_goal or '(none)'}\n"
-            f"HYPOTHESIS  : {self.working_hypothesis or '(unset)'}\n"
-            "LIVE STACK  :\n"
-            f"{live_str}\n"
-            "LEDGER (last 5 mutations):\n"
-            f"{ledger_str}\n"
-            f"STATE       : {self.awareness_state}\n"
-            f"LAST ACTION : {self.last_action}\n"
-            "====================="
+            "=== ORCHESTRATOR STATE ===\n"
+            f"GOAL: {self.global_intent}\n\n"
+            f"PLAN:\n{self.plan}\n\n"
+            f"FINDINGS:\n{self.findings}\n\n"
+            f"NEXT TASKS:\n{self.next_tasks}\n"
+            f"{reports_str}"
+            f"{synthesis_str}"
+            f"STATE: {self.awareness_state}\n"
+            "=========================="
         )
 
+    def to_dict(self) -> dict:
+        return {
+            "global_intent": self.global_intent,
+            "plan": self.plan,
+            "findings": self.findings,
+            "next_tasks": self.next_tasks,
+            "synthesis": self.synthesis,
+            "child_reports": [
+                {
+                    "worker_id": r.worker_id,
+                    "task": r.task,
+                    "findings": r.findings,
+                    "status": r.status,
+                }
+                for r in self.child_reports
+            ],
+            "awareness_state": self.awareness_state,
+            "timestamp": datetime.now().isoformat(),
+        }
 
-# =====================================================================
-# DEVELOPER AGENT (Runtime Host & Stack Machine Orchestrator)
-# =====================================================================
+
 class DeveloperAgent:
     def __init__(
         self,
         project_root: str,
         key_rotator: GroqKeyRotator,
-        model: str = "qwen/qwen3.8-27b"
+        model: str = "qwen/qwen3.8-27b",
+        session_file: str = None,
     ):
-        self.root = Path(project_root)
+        self.root = Path(project_root).resolve()
         self.rotator = key_rotator
         self.model = model
-
-        # Local AST Indexer
         self.indexer = ASTIndexer()
-
-        # Cognitive state
         self.frame = WorkingFrame()
-
-        # Token telemetry
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
-
-        # Snapshot storage: { file_name: [ {content, hash, reason}, ... ] }
-        self.file_snapshots: Dict[str, List[Dict[str, Any]]] = {}
-
-        # Bare filename index: {"payment.java": Path(...)}
-        self.file_index: Dict[str, Path] = {}
+        self.file_index: Dict[str, List[Path]] = {}
+        self.target_services: set = set()
+        self.session_file = session_file or "cognitive_os_session.json"
         self._build_index()
 
-        # Inspection loop cache
-        self.inspected_cache = set()
+    # ------------------------------------------------------------------ infra
 
-    # =================================================================
-    # TOPOLOGY & INDEXING
-    # =================================================================
     def _build_index(self):
         self.file_index.clear()
         for p in self.root.rglob("*.java"):
             if "test" not in p.parts and "target" not in p.parts:
-                self.file_index[p.name.lower()] = p
+                self.file_index.setdefault(p.name.lower(), []).append(p)
 
     def list_services(self) -> List[str]:
         services = []
@@ -118,736 +149,562 @@ class DeveloperAgent:
                     services.append(p.name)
         return sorted(services)
 
-    def list_service_files(self, service_name: str) -> List[str]:
-        srv_path = self.root / service_name
-        if not srv_path.exists():
-            return [f"Service '{service_name}' not found."]
-        files = []
-        for f in srv_path.rglob("*.java"):
-            if "test" not in f.parts and "target" not in f.parts:
-                files.append(f.name)
-        return sorted(files)
-
-    def _resolve(self, name_or_path: str) -> Optional[Path]:
-        clean = Path(name_or_path.strip().replace("\\", "/")).name.lower()
-        return self.file_index.get(clean)
-
-    # =================================================================
-    # SCOPE RESOLVER
-    # =================================================================
-    def resolve_scope_content(self, target_scope: str) -> str:
-        # 1. Check for line slices: e.g. "Payment.java lines 10-30"
-        match_lines = re.search(
-            r"([a-zA-Z0-9_\-\.]+\.java)\s+lines?\s+(\d+)\s*-\s*(\d+)",
-            target_scope,
-            re.IGNORECASE
-        )
-        if match_lines:
-            file_name = match_lines.group(1)
-            start_l = int(match_lines.group(2))
-            end_l = int(match_lines.group(3))
-
-            target_path = self._resolve(file_name)
-            if not target_path:
-                return f"Error: File '{file_name}' not found in repository index."
-
-            raw_text = target_path.read_text(encoding="utf-8", errors="ignore")
-            lines = raw_text.splitlines(keepends=True)
-            if not lines or not raw_text.strip():
-                return (f"Notice: File '{file_name}' exists at "
-                        f"'{target_path.relative_to(self.root)}' but is completely EMPTY "
-                        f"(0 lines). If you need to populate it, use `write_file`.")
-
-            start = max(1, start_l)
-            end = min(len(lines), end_l)
-            return "".join([f"{i}: {l}" for i, l in enumerate(lines[start - 1:end], start=start)])
-
-        # 2. Check for any Java file mentioned anywhere in the string
-        match_java = re.search(r"([a-zA-Z0-9_\-\.]+\.java)", target_scope, re.IGNORECASE)
-        if match_java:
-            file_name = match_java.group(1)
-            target_path = self._resolve(file_name)
-            if not target_path:
-                return f"Error: File '{file_name}' not found in repository index."
-
-            raw_text = target_path.read_text(encoding="utf-8", errors="ignore")
-            if not raw_text.strip():
-                return (f"Notice: File '{file_name}' exists at "
-                        f"'{target_path.relative_to(self.root)}' but is completely EMPTY "
-                        f"(0 lines). If you need to populate it, use `write_file`.")
-
-            return self.indexer.generate_skeleton(target_path)
-
-        # 3. If target is a service name or generic scope
-        for srv in self.list_services():
-            if srv in target_scope:
-                files = self.list_service_files(srv)
-                return f"Service: {srv}\nFiles available: {', '.join(files)}"
-
-        return (f"Scope '{target_scope}' did not match any file or service. "
-                f"Available services: {', '.join(self.list_services())}")
-
-    # =================================================================
-    # FIX #1 — PINPOINT: SURGICAL LINES (empty-file notice)
-    # =================================================================
-    def read_surgical_lines(self, file_name: str, start_line: int, end_line: int) -> str:
-        self.frame.awareness_state = "PINPOINT"
-        target = self._resolve(file_name)
-        if not target:
-            return f"Error: File '{file_name}' not found in repository index."
+    def _service_of(self, path: Path) -> str:
         try:
-            raw_text = target.read_text(encoding="utf-8", errors="ignore")
-            lines = raw_text.splitlines(keepends=True)
-
-            # Explicit notice for empty files so the model stops escalating
-            # end_line hoping to find code "further down."
-            if not lines or not raw_text.strip():
-                try:
-                    rel_path = target.relative_to(self.root)
-                except ValueError:
-                    rel_path = target.name
-                return (
-                    f"Notice: File '{file_name}' exists at '{rel_path}' "
-                    f"but is completely EMPTY (0 lines). "
-                    f"To populate it, inspect a sibling file for structure, "
-                    f"then use `write_file`."
-                )
-
-            start = max(1, int(start_line))
-            end = min(len(lines), int(end_line))
-            return "".join([f"{i}: {l}" for i, l in enumerate(lines[start - 1:end], start=start)])
-        except Exception as e:
-            return f"Error reading lines: {e}"
-
-    # =================================================================
-    # FIX #2a — LOCATE FILE (immediate path lookup)
-    # =================================================================
-    def locate_file(self, file_name: str) -> str:
-        """Immediately returns the exact owning service and relative path of any file."""
-        target = self._resolve(file_name)
-        if not target:
-            return f"File '{file_name}' not found anywhere in repository index."
-        try:
-            return f"Found '{file_name}' at: {target.relative_to(self.root)}"
+            return path.relative_to(self.root).parts[0]
         except Exception:
-            return f"Found '{file_name}' at: {target}"
+            return ""
 
-    # =================================================================
-    # STATE 3 — MUTATE: TRANSACTIONAL PATCHING
-    # =================================================================
-    def apply_code_patch(
-        self,
-        file_name: str,
-        target_snippet: str,
-        replacement_snippet: str,
-        reason: str = "manual patch"
-    ) -> str:
-        self.frame.awareness_state = "MUTATE"
-        target = self._resolve(file_name)
-        if not target:
-            return f"Error: File '{file_name}' not found."
+    def _rel(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(self.root)).replace("\\", "/")
+        except Exception:
+            return str(path)
 
-        raw_content = target.read_text(encoding="utf-8")
-
-        # Hard guard: patching an empty file is meaningless
-        if not raw_content.strip():
-            self.frame.last_action = f"PATCH BLOCKED on {file_name} (file is empty)"
-            return (f"Error: File '{file_name}' is EMPTY. `apply_code_patch` requires an existing "
-                    f"target snippet. Use `write_file` to populate the file instead.")
-
-        has_crlf = "\r\n" in raw_content
-
-        norm_content = raw_content.replace("\r\n", "\n")
-        norm_target = target_snippet.replace("\r\n", "\n").strip("\r\n")
-        norm_replacement = replacement_snippet.replace("\r\n", "\n").strip("\r\n")
-
-        # Snapshot raw original code
-        if file_name not in self.file_snapshots:
-            self.file_snapshots[file_name] = []
-        snapshot_hash = hashlib.sha1(raw_content.encode("utf-8")).hexdigest()
-        self.file_snapshots[file_name].append({
-            "content": raw_content,
-            "hash": snapshot_hash,
-            "reason": reason,
-        })
-
-        if norm_target not in norm_content:
-            self.file_snapshots[file_name].pop()
-            self.frame.last_action = f"PATCH FAILED on {file_name} (target not found)"
-            return (f"Error: Target snippet not found in {file_name}. "
-                    f"No snapshot retained. Inspect with surgical lines first.")
-
-        updated_norm = norm_content.replace(norm_target, norm_replacement, 1)
-        final_content = updated_norm.replace("\n", "\r\n") if has_crlf else updated_norm
-        target.write_text(final_content, encoding="utf-8")
-
-        self.frame.revision_ledger.append(
-            RevisionEntry(file_name=file_name, snapshot_hash=snapshot_hash, reason=reason)
-        )
-        self.frame.last_action = f"PATCHED {file_name} @ {snapshot_hash[:8]} ({reason})"
-        return (f"✅ Patched {file_name}. Snapshot {snapshot_hash[:8]} saved. "
-                f"Next: verify dependent files (State 4: PROPAGATE).")
-
-    # =================================================================
-    # FIX #2b — WRITE (full-file write for empty/new files)
-    # =================================================================
-    def write_file(
-        self,
-        file_name: str,
-        content: str,
-        reason: str = "initial file creation"
-    ) -> str:
-        """Write complete content to a file — for empty files or brand-new files.
-
-        Used when `apply_code_patch` cannot work because there is no
-        target snippet to anchor to (e.g. the file is 0 bytes).
-        """
-        self.frame.awareness_state = "MUTATE"
-
-        # Resolve to an existing path OR place alongside repo root
-        target = self._resolve(file_name)
-        if not target:
-            target = self.root / file_name
-
-        # Snapshot existing content (empty string if the file doesn't yet exist)
-        existing_raw = target.read_text(encoding="utf-8") if target.exists() else ""
-        snapshot_hash = hashlib.sha1(existing_raw.encode("utf-8")).hexdigest()
-
-        if file_name not in self.file_snapshots:
-            self.file_snapshots[file_name] = []
-        self.file_snapshots[file_name].append({
-            "content": existing_raw,
-            "hash": snapshot_hash,
-            "reason": reason,
-        })
-
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-
-        # Rebuild index so newly created files become resolvable
-        self._build_index()
-
-        self.frame.revision_ledger.append(
-            RevisionEntry(file_name=file_name, snapshot_hash=snapshot_hash, reason=reason)
-        )
-        line_count = len(content.splitlines())
-        self.frame.last_action = f"WROTE {file_name} ({line_count} lines, {reason})"
-        return f"✅ Successfully wrote {line_count} lines to {file_name}."
-
-    # =================================================================
-    # STATE 5 — BACKTRACK: PHYSICAL ROLLBACK
-    # =================================================================
-    def rollback_file(self, file_name: str) -> str:
-        self.frame.awareness_state = "BACKTRACK"
-        stack = self.file_snapshots.get(file_name)
-        if not stack:
-            self.frame.last_action = f"ROLLBACK FAILED on {file_name} (no snapshot)"
-            return f"Error: No previous snapshots found for {file_name}."
-
-        previous = stack.pop()
-        target = self._resolve(file_name)
-        if not target:
-            self.frame.last_action = f"ROLLBACK FAILED on {file_name} (file missing)"
-            return f"Error: File '{file_name}' not found during rollback."
-
-        target.write_text(previous["content"], encoding="utf-8")
-
-        for sg in self.frame.sub_goal_stack:
-            if sg.file_name == file_name and sg.status == "ACTIVE":
-                sg.status = "INVALIDATED"
-
-        self.frame.last_action = f"ROLLED BACK {file_name} → {previous['hash'][:8]}"
-        return (f"↩️ Rollback successful: {file_name} restored to "
-                f"snapshot {previous['hash'][:8]} (reason was: {previous['reason']}).")
-
-    # =================================================================
-    # SUB-GOAL STACK CONTROL PRIMITIVES
-    # =================================================================
-    def push_sub_goal(self, description: str, file_name: Optional[str] = None) -> str:
-        for sg in self.frame.sub_goal_stack:
-            if sg.status == "ACTIVE":
-                sg.status = "PENDING"
-        new_goal = SubGoal(description=description, status="ACTIVE", file_name=file_name)
-        self.frame.sub_goal_stack.append(new_goal)
-        self.frame.active_sub_goal = description
-        self.frame.last_action = f"PUSHED sub-goal: {description}"
-        return f"📌 Pushed sub-goal: {description} (file: {file_name or 'n/a'})"
-
-    def declare_goal_complete(self) -> str:
-        if not self.frame.sub_goal_stack:
-            return "No active sub-goals to complete."
-        for sg in reversed(self.frame.sub_goal_stack):
-            if sg.status == "ACTIVE":
-                sg.status = "DONE"
-                break
-        for sg in reversed(self.frame.sub_goal_stack):
-            if sg.status == "PENDING":
-                sg.status = "ACTIVE"
-                self.frame.active_sub_goal = sg.description
-                self.frame.last_action = f"GOAL DONE. Now ACTIVE: {sg.description}"
-                return f"✅ Sub-goal complete. Now ACTIVE: {sg.description}"
-        self.frame.active_sub_goal = None
-        self.frame.last_action = "GOAL DONE. Stack empty."
-        return "✅ Sub-goal complete. No further pending sub-goals."
-
-    def update_hypothesis(self, hypothesis: str) -> str:
-        self.frame.working_hypothesis = hypothesis
-        self.frame.last_action = "HYPOTHESIS updated"
-        return f"🧠 Hypothesis updated: {hypothesis}"
-
-    # =================================================================
-    # LLM CALL WRAPPER (With Key Rotation & Telemetry)
-    # =================================================================
-    def _call_model(self, messages: List[Dict[str, str]], tools: List[Dict[str, Any]], max_tokens: int = 800):
+    def _chat(self, messages, max_tokens: int = 2000) -> str:
         def call(client):
-            kwargs = dict(
+            res = client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 temperature=0.1,
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
+                tools=None,
             )
-            if tools:
-                kwargs["tools"] = tools
-                kwargs["tool_choice"] = "auto"
-            res = client.chat.completions.create(**kwargs)
             if res.usage:
                 self.total_prompt_tokens += res.usage.prompt_tokens
                 self.total_completion_tokens += res.usage.completion_tokens
             return res
 
-        return self.rotator.execute_with_failover(call)
+        res = self.rotator.execute_with_failover(call)
+        text = res.choices[0].message.content or ""
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
-    # =================================================================
-    # RECURSIVE FRAME DISPATCHER (Stack Push / Pop)
-    # =================================================================
-    def spawn_frame(self, request: FrameSpawnRequest) -> FrameReturnPacket:
-        # Calculate current recursion depth from worker_id (e.g. "W1.1" -> 2)
-        current_depth = len(request.child_id.split("."))
+    @staticmethod
+    def _extract_json(text: str) -> Optional[dict]:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return None
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
 
-        print(f"\n[Stack Push -> {request.child_id}] (Depth: {current_depth}) Scope: {request.target_scope}")
-        print(f"  Goal: {request.sub_goal}")
+    @staticmethod
+    def _cap(text: str) -> str:
+        if len(text) <= MAX_TOOL_CHARS:
+            return text
+        return text[:MAX_TOOL_CHARS] + f"\n...[truncated, {len(text)} chars total]"
 
-        scope_content = self.resolve_scope_content(request.target_scope)
+    # ------------------------------------------------------------------ tools
 
-        # ===== CRITICAL SEPARATION OF CONCERNS =====
-        # Root worker (W1) gets ONLY orchestration + light inspection tools
-        if current_depth == 1:
-            tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "locate_file",
-                        "description": "Find the path of a file in the repo.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"file_name": {"type": "string"}},
-                            "required": ["file_name"]
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "read_surgical_lines",
-                        "description": "Read max 30 lines from a file to check if empty or understand structure.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "file_name": {"type": "string"},
-                                "start_line": {"type": "integer"},
-                                "end_line": {"type": "integer"}
-                            },
-                            "required": ["file_name", "start_line", "end_line"]
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "list_service_files",
-                        "description": "List all Java files in a service.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"service_name": {"type": "string"}},
-                            "required": ["service_name"]
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "update_hypothesis",
-                        "description": "Update working hypothesis.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"hypothesis": {"type": "string"}},
-                            "required": ["hypothesis"]
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_working_frame",
-                        "description": "Get current working frame state.",
-                        "parameters": {"type": "object", "properties": {}}
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "spawn_child_worker",
-                        "description": "Spawn a child worker to investigate a specific task. Use this for all detailed code inspection or file writes.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "target_scope": {"type": "string"},
-                                "sub_goal": {"type": "string"},
-                                "expected_deliverable": {"type": "string"}
-                            },
-                            "required": ["target_scope", "sub_goal", "expected_deliverable"]
-                        }
-                    }
-                }
-            ]
+    def _resolve(self, name: str) -> Tuple[Optional[Path], Optional[str]]:
+        name = name.strip().strip("'\"").replace("\\", "/")
+        if not name:
+            return None, "Error: empty file name."
+
+        direct = (self.root / name)
+        if direct.is_file():
+            return direct, None
+
+        matches = self.file_index.get(Path(name).name.lower(), [])
+        if "/" in name:
+            matches = [m for m in matches if self._rel(m).lower().endswith(name.lower())]
+
+        if len(matches) == 1:
+            return matches[0], None
+        if len(matches) > 1:
+            preferred = [m for m in matches if self._service_of(m) in self.target_services]
+            if len(preferred) == 1:
+                return preferred[0], None
+            opts = ", ".join(self._rel(m) for m in matches)
+            return None, f"Ambiguous '{name}'. Use one of: {opts}"
+        return None, f"Error: File '{name}' not found in repo."
+
+    def read_file(self, file_name: str) -> str:
+        path, err = self._resolve(file_name)
+        if err:
+            return err
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+            if not content.strip():
+                return f"[EMPTY FILE] {self._rel(path)} is empty (0 bytes)"
+            return self._cap(f"[{self._rel(path)}]\n{content}")
+        except Exception as e:
+            return f"Error reading file: {e}"
+
+    def get_file_skeleton(self, file_name: str) -> str:
+        path, err = self._resolve(file_name)
+        if err:
+            return err
+        try:
+            return self._cap(self.indexer.generate_skeleton(path))
+        except Exception as e:
+            return f"Error: {e}"
+
+    def list_files(self, directory: str = "") -> str:
+        directory = directory.strip().strip("'\"").replace("\\", "/")
+        base = (self.root / directory) if directory else self.root
+        if not base.is_dir():
+            return f"Error: directory '{directory}' not found."
+        files = []
+        for p in sorted(base.rglob("*.java")):
+            if "test" in p.parts or "target" in p.parts:
+                continue
+            files.append(self._rel(p))
+        if not files:
+            return "(no java files)"
+        return self._cap("\n".join(files))
+
+    def grep_files(self, pattern: str) -> str:
+        pattern = pattern.strip().strip("'\"")
+        if not pattern:
+            return "Error: empty pattern."
+        try:
+            rx = re.compile(pattern)
+        except re.error:
+            rx = re.compile(re.escape(pattern))
+
+        if self.target_services:
+            roots = [self.root / s for s in sorted(self.target_services)]
         else:
-            # Child workers (depth >= 2) get the mutation tools
-            tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "locate_file",
-                        "description": "Find the path of a file in the repo.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"file_name": {"type": "string"}},
-                            "required": ["file_name"]
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "read_surgical_lines",
-                        "description": "Read specific lines from a file.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "file_name": {"type": "string"},
-                                "start_line": {"type": "integer"},
-                                "end_line": {"type": "integer"}
-                            },
-                            "required": ["file_name", "start_line", "end_line"]
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "list_service_files",
-                        "description": "List all Java files in a service.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"service_name": {"type": "string"}},
-                            "required": ["service_name"]
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "write_file",
-                        "description": "Write complete content to a file.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "file_name": {"type": "string"},
-                                "content": {"type": "string"},
-                                "reason": {"type": "string"}
-                            },
-                            "required": ["file_name", "content"]
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "apply_code_patch",
-                        "description": "Patch a specific snippet in a file.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "file_name": {"type": "string"},
-                                "target_snippet": {"type": "string"},
-                                "replacement_snippet": {"type": "string"},
-                                "reason": {"type": "string"}
-                            },
-                            "required": ["file_name", "target_snippet", "replacement_snippet"]
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "rollback_file",
-                        "description": "Rollback a file to previous snapshot.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"file_name": {"type": "string"}},
-                            "required": ["file_name"]
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "update_hypothesis",
-                        "description": "Update working hypothesis.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"hypothesis": {"type": "string"}},
-                            "required": ["hypothesis"]
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_working_frame",
-                        "description": "Get current working frame state.",
-                        "parameters": {"type": "object", "properties": {}}
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "spawn_child_worker",
-                        "description": "Spawn another child to investigate a sub-component.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "target_scope": {"type": "string"},
-                                "sub_goal": {"type": "string"},
-                                "expected_deliverable": {"type": "string"}
-                            },
-                            "required": ["target_scope", "sub_goal", "expected_deliverable"]
-                        }
-                    }
-                }
-            ]
+            roots = [self.root]
 
-        system_prompt = f"""You are Cognitive Worker Frame [{request.child_id}].
-GOAL: {request.sub_goal}
-EXPECTED DELIVERABLE: {request.expected_deliverable}
+        hits = []
+        for base in roots:
+            for p in base.rglob("*.java"):
+                if "test" in p.parts or "target" in p.parts:
+                    continue
+                try:
+                    for i, line in enumerate(
+                        p.read_text(encoding="utf-8", errors="ignore").splitlines(), 1
+                    ):
+                        if rx.search(line):
+                            hits.append(f"{self._rel(p)}:{i}: {line.strip()[:160]}")
+                            if len(hits) >= MAX_GREP_HITS:
+                                hits.append("...[hit limit reached]")
+                                return "\n".join(hits)
+                except Exception:
+                    continue
+        return "\n".join(hits) if hits else "(no matches)"
 
-WHO YOU ARE (by depth):
-CONSTRAINT FOR W1 (ORCHESTRATOR):
-When you spawn a child, follow this EXACTLY:
-1. Pick ONE specific task (not "read and analyze", pick "extract method list" OR "count lines" OR "verify caller")
-2. Name the EXACT file or scope
-3. End sub_goal with: "Do NOT read other files."
-4. Make expected_deliverable ONE sentence, max. Example: "Report one number: how many lines?"
-5. Wait for child to report back
-6. Based on report, decide next spawn
+    def write_file(self, file_name: str, content: str) -> str:
+        path, err = self._resolve(file_name)
+        if err:
+            if err.startswith("Ambiguous"):
+                return err
+            rel = file_name.strip().replace("\\", "/")
+            if "/" not in rel:
+                return f"ERROR: '{file_name}' does not exist. Give a repo-relative path to create it."
+            path = (self.root / rel).resolve()
+        else:
+            path = path.resolve()
 
-EXAMPLES:
-GOOD: sub_goal: "Count lines in ModelService.java. Report just the number."
-BAD:  sub_goal: "Analyze ModelService.java and related files"
+        if self.root not in path.parents:
+            return "ERROR: path outside repo."
 
-GOOD: sub_goal: "List all public methods in ModelManager. Format: name(params) return_type."
-BAD:  sub_goal: "Understand what ModelService should contain"
-- Depth 1 (W1): ORCHESTRATOR. You do NOT write code. You inspect topology and delegate all detailed work.
-- Depth 2+ (W1.1, W1.2, ...): SPECIALIST. You execute focused tasks. You CAN write code when spawned for that purpose.
+        try:
+            if path.exists():
+                old = path.read_text(encoding="utf-8", errors="ignore")
+                if old.strip():
+                    path.with_suffix(path.suffix + ".bak").write_text(old, encoding="utf-8")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        except Exception as e:
+            return f"ERROR writing file: {e}"
 
-YOUR JOB (W1 only):
-1. Understand the request
-2. Locate files mentioned
-3. Decide if the target file is empty → spawn a child to populate it
-4. Spawn separate children to verify each caller/implementor
-5. Collect their reports
-6. Synthesize final report to parent (or dev if you're W1)
+        self._build_index()
 
-DO NOT (W1 only):
-- Do NOT read 50 lines of code yourself
-- Do NOT write files yourself
-- Do NOT patch code yourself
-SPAWN A CHILD for these tasks.
+        warn = ""
+        posix = path.as_posix()
+        pkg = re.search(r"^\s*package\s+([\w.]+)\s*;", content, re.MULTILINE)
+        if pkg and "src/main/java/" in posix:
+            expected = posix.split("src/main/java/", 1)[1].rsplit("/", 1)[0].replace("/", ".")
+            if pkg.group(1) != expected:
+                warn = f"\nWARNING: package '{pkg.group(1)}' does not match folder '{expected}'"
 
-YOUR JOB (W1.X child):
-1. Read assigned file thoroughly
-2. Extract the specific facts asked for (method signatures, imports, callers, etc.)
-3. Report findings clearly back to parent
-4. If told to write/patch, do it and report success
+        return (
+            f"WROTE {self._rel(path)} ({len(content.splitlines())} lines){warn}\n"
+            f"READBACK:\n{self.read_file(self._rel(path))}"
+        )
 
-CRITICAL: Each worker spawned is responsible for exactly ONE task. Never spawn a single child to do 3 different inspections."""
+    # --------------------------------------------------------------- topology
+
+    def _extract_topology_facts(self, user_question: str) -> str:
+        target_services = set()
+        q = user_question.lower()
+        words = re.findall(r"[\w\.-]+", q)
+
+        for w in words:
+            clean = w if w.endswith(".java") else f"{w}.java"
+            for path in self.file_index.get(clean, []):
+                svc = self._service_of(path)
+                if svc:
+                    target_services.add(svc)
+
+        for srv in self.list_services():
+            if srv.lower() in q or srv.replace("-", "").lower() in q:
+                target_services.add(srv)
+
+        self.target_services = target_services
+        all_services = self.list_services()
+        facts = [f"ALL SERVICES: {', '.join(all_services)}"]
+
+        if not target_services:
+            facts.append(
+                "TARGET SERVICES: (not identified; workers should use list_files / grep_files "
+                "to locate relevant code)"
+            )
+            return "\n".join(facts)
+
+        facts.append(f"TARGET SERVICES: {', '.join(sorted(target_services))}")
+
+        for service in sorted(target_services):
+            service_path = self.root / service
+            lines = []
+            for java_file in service_path.rglob("*.java"):
+                if "test" in java_file.parts or "target" in java_file.parts:
+                    continue
+                try:
+                    rel = str(java_file.relative_to(service_path)).replace("\\", "/")
+                    content = java_file.read_text(encoding="utf-8", errors="ignore")
+                    if not content.strip():
+                        lines.append(f"{java_file.name} (EMPTY FILE) at {rel}")
+                        continue
+
+                    cm = re.search(r"(class|interface|enum|record)\s+(\w+)", content)
+                    if not cm:
+                        continue
+                    info = f"{cm.group(2)} ({cm.group(1)}) at {rel}"
+                    ext = re.search(r"extends\s+([\w<>, ]+?)\s*(?:implements|\{)", content)
+                    imp = re.search(r"implements\s+([^{]+)", content)
+                    if ext:
+                        info += f" extends {ext.group(1).strip()}"
+                    if imp:
+                        info += f" implements {imp.group(1).strip()}"
+                    lines.append(info)
+                except Exception:
+                    continue
+
+            if lines:
+                facts.append(f"\n{service}:")
+                facts.extend(f"  - {l}" for l in lines)
+
+        return "\n".join(facts)
+
+    # ---------------------------------------------------------------- workers
+
+    def spawn_worker(
+        self,
+        worker_id: str,
+        task: str,
+        target_files: str = "",
+        can_write: bool = False,
+        context: str = "",
+    ) -> ChildReport:
+        print(f"\n[Stack Push -> {worker_id}]{' (write)' if can_write else ''}")
+        print(f"  Task: {task}")
+
+        write_doc = ""
+        if can_write:
+            write_doc = """
+- To create or overwrite a file, reply with EXACTLY this format and nothing else:
+WRITE_FILE: <path or filename>
+```<language>
+<full file content>
+```
+Before writing, read neighbouring/related files so your package, imports, naming and style
+match the codebase. Write complete files only, never fragments."""
+
+        system_prompt = f"""You are Worker {worker_id}, a focused sub-agent working inside a code repository.
+
+TOOLS (call at most one per message, on its own line):
+- TOOL: read_file(filename_or_relative_path)
+- TOOL: get_file_skeleton(filename_or_relative_path)
+- TOOL: list_files(directory)   (directory relative to repo root, blank for all)
+- TOOL: grep_files(pattern)     (regex or literal; returns path:line: text){write_doc}
+
+RULES:
+- Do only the assigned task. Read only what you need.
+- Base every claim on file contents you actually read; if something is missing or unclear, say so.
+- Finish with a complete, concrete report and NO tool call in that final message.
+- Tool calls must be written exactly as `TOOL: name(arg)`. Do not use XML/<tool_call> tags.
+- Your final report must include the actual code/signatures you found, not a statement that you will read."""
+
+        user_message = f"ASSIGNED FILES/SCOPE: {target_files or '(not specified)'}\n"
+        if context:
+            user_message += f"\nCONTEXT FROM ORCHESTRATOR:\n{context}\n"
+        user_message += f"\nTASK: {task}"
 
         messages = [
             {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": f"SCOPE:\n{scope_content}\n\nBegin work."
-            }
+            {"role": "user", "content": user_message},
         ]
 
-        child_reports = []
-        mutations = []
+        actions: List[str] = []
+        final = ""
+        finished = False
 
-        MAX_TURNS = 15
-        for turn in range(MAX_TURNS):
-            try:
-                res = self._call_model(messages, tools, max_tokens=2000)
-            except Exception as e:
-                err_str = str(e)
-                if "tool_use_failed" in err_str and "<tool_call>" in err_str:
-                    match_fn = re.search(r"<function=([a-zA-Z0-9_]+)>", err_str)
-                    if match_fn:
-                        fn_name = match_fn.group(1)
-                        raw_params = re.findall(
-                            r"<parameter=([a-zA-Z0-9_]+)>\s*([\s\S]*?)\s*</parameter>", err_str
-                        )
-                        recovered_args = {}
-                        for p_name, p_val in raw_params:
-                            val = p_val.strip()
-                            recovered_args[p_name] = int(val) if val.isdigit() else val
+        for _ in range(MAX_WORKER_TURNS):
+            msg = self._chat(messages, max_tokens=3000)
+            messages.append({"role": "assistant", "content": msg})
+            final = msg
 
-                        print(f"  [{request.child_id}] [Recovered XML Call] -> {fn_name}({recovered_args})")
-                        output = self._dispatch_tool(fn_name, recovered_args, request.child_id, child_reports, mutations)
-                        messages.append({
-                            "role": "user",
-                            "content": f"Tool returned:\n{output}\nContinue."
-                        })
-                        continue
+            w = WRITE_RE.search(msg)
+            if w:
+                if can_write:
+                    result = self.write_file(w.group(1), w.group(2))
+                    actions.append(result.split("\n")[0])
+                else:
+                    result = "ERROR: you do not have write permission."
+                messages.append({"role": "user", "content": f"TOOL RESULT:\n{result}"})
+                continue
 
-                print(f"  [{request.child_id}] Warning: {e}. Forcing completion...")
-                break
+            call = parse_tool_call(msg)
+            if call:
+                name, arg = call
+                if name == "read_file":
+                    result = self.read_file(arg)
+                elif name == "get_file_skeleton":
+                    result = self.get_file_skeleton(arg)
+                elif name == "list_files":
+                    result = self.list_files(arg)
+                else:
+                    result = self.grep_files(arg)
+                messages.append({"role": "user", "content": f"TOOL RESULT:\n{result}"})
+                continue
 
-            msg = res.choices[0].message
-            messages.append(msg)
+            if looks_like_tool_markup(msg):
+                messages.append({"role": "user", "content":
+                    "TOOL ERROR: could not parse that call. Use exactly one line: "
+                    "TOOL: read_file(path/to/File.java)"})
+                continue
 
-            if not msg.tool_calls:
-                print(f"[Stack Pop <- {request.child_id}] Done\n")
-                return FrameReturnPacket(
-                    child_id=request.child_id,
-                    parent_id=request.parent_id,
-                    status="SUCCESS",
-                    scalar_deduction=msg.content or "Completed.",
-                    mutations_applied=mutations,
-                    child_reports=child_reports
-                )
+            finished = True
+            break
 
-            for call in msg.tool_calls:
-                fn_name = call.function.name
-                try:
-                    args = json.loads(call.function.arguments)
-                except Exception:
-                    args = {}
+        if not finished:
+            final += "\n\n[worker hit turn limit before finishing]"
+        if actions:
+            final += "\n\nACTIONS: " + "; ".join(actions)
 
-                # Deduplication guard
-                call_hash = f"{fn_name}:{json.dumps(args, sort_keys=True)}"
-                if call_hash in self.inspected_cache:
-                    print(f"  [{request.child_id}] [DUPLICATE BLOCKED] -> {fn_name}")
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": call.id,
-                        "content": f"Already called {fn_name} with these params. Move forward."
-                    })
-                    continue
+        report = ChildReport(worker_id, task, final, "COMPLETED" if finished else "INCOMPLETE")
+        self.frame.child_reports.append(report)
+        print(f"[Stack Pop <- {worker_id}]")
+        print(f"  Findings: {final[:300]}...\n")
+        return report
 
-                self.inspected_cache.add(call_hash)
-                print(f"  [{request.child_id}] -> {fn_name}({args})")
-                tool_output = self._dispatch_tool(fn_name, args, request.child_id, child_reports, mutations)
+    # ----------------------------------------------------------- orchestration
+    @staticmethod
+    def _clean_workers(raw) -> List[dict]:
+        workers = []
+        if not isinstance(raw, list):
+            return workers
+        for w in raw[:MAX_WORKERS_PER_ROUND]:
+            if not isinstance(w, dict) or not w.get("task"):
+                continue
+            files = w.get("files", "")
+            if isinstance(files, list):
+                files = ", ".join(str(f) for f in files)
+            workers.append(
+                {
+                    "task": str(w["task"]),
+                    "files": str(files),
+                    "write": bool(w.get("write", False)),
+                }
+            )
+        return workers
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": str(tool_output)[:3000]
-                })
+    def create_intelligent_plan(self, user_question: str) -> List[dict]:
+        self.frame.global_intent = user_question
+        self.frame.awareness_state = "PLANNING"
 
-        return FrameReturnPacket(
-            child_id=request.child_id,
-            parent_id=request.parent_id,
-            status="FAILED",
-            scalar_deduction="Turn limit reached.",
-            mutations_applied=mutations,
-            child_reports=child_reports
+        topology = self._extract_topology_facts(user_question)
+
+        system_prompt = """You are the Orchestrator of a multi-agent developer system working on a code repository.
+
+Given repository facts and a user goal, produce a plan and delegate work to child workers.
+
+Each worker has a fresh context and tools to read files, view skeletons, list files, grep, and (only if permitted) write files.
+Design workers so each has ONE narrow, self-contained task and reads only a few files.
+Grant "write": true only to workers whose task is to create or modify files, and only if the goal actually requires changes.
+If the goal only asks for analysis or explanation, use read-only workers.
+If the goal needs changes, first use read-only workers to gather what is needed; later rounds will handle edits.
+Do not assume anything about files you have not been shown; have workers verify.
+
+Respond with ONLY a JSON object:
+{
+"plan": "2-3 sentence strategy",
+"findings": "files/components from the facts that look relevant and why",
+"workers": [
+{"task": "specific instruction", "files": "comma-separated file names or scope", "write": false}
+]
+}"""
+
+        user_message = f"{topology}\n\nUSER GOAL: {user_question}\n\nProduce the JSON plan."
+
+        text = self._chat(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=1200,
+        )
+        data = self._extract_json(text)
+
+        if data:
+            self.frame.plan = str(data.get("plan", ""))
+            self.frame.findings = str(data.get("findings", ""))
+            workers = self._clean_workers(data.get("workers"))
+        else:
+            self.frame.plan = text
+            workers = []
+
+        if not workers:
+            workers = [
+                {
+                    "task": (
+                        "Investigate the repository to address this goal and report "
+                        f"concrete findings: {user_question}"
+                    ),
+                    "files": "",
+                    "write": False,
+                }
+            ]
+
+        self.frame.next_tasks = "\n".join(
+            f"{i}. {'[WRITE] ' if w['write'] else ''}{w['task']} ({w['files']})"
+            for i, w in enumerate(workers, 1)
+        )
+        self.frame.awareness_state = "READY_FOR_EXECUTION"
+
+        total = self.total_prompt_tokens + self.total_completion_tokens
+        print(
+            f"[Telemetry] Prompt: {self.total_prompt_tokens} | "
+            f"Completion: {self.total_completion_tokens} | Total: {total}\n"
+        )
+        print(self.frame.render() + "\n")
+        return workers
+
+    def synthesize(self, round_reports: List[ChildReport]) -> dict:
+        system_prompt = """You are the Orchestrator reviewing child worker reports.
+
+Decide whether the user's goal is fully satisfied.
+
+Base your judgement only on the reports. Do not assume work happened that the reports do not show.
+If the goal requires file changes and no worker has successfully written them, they are NOT done yet.
+If a write happened, check the report's readback/warnings; if something is wrong, schedule a fix.
+If more information is needed, or edits/fixes/verification remain, schedule workers (same rules: narrow tasks, "write": true only for file modification).
+Pass worker tasks all the specifics they need (exact signatures, paths, package names) because they do not see other reports.
+
+Respond with ONLY a JSON object:
+{
+"summary": "concise factual state: what was found, what was done, what remains",
+"status": "DONE" or "CONTINUE",
+"workers": [ {"task": "...", "files": "...", "write": false} ]
+}
+Use an empty workers list when status is DONE."""
+
+        reports_text = "\n\n".join(
+            f"[{r.worker_id}] ({r.status}) TASK: {r.task}\nREPORT:\n{r.findings}"
+            for r in round_reports
+        )
+        prior = f"PRIOR SYNTHESIS:\n{self.frame.synthesis}\n\n" if self.frame.synthesis else ""
+        user_message = (
+            f"USER GOAL: {self.frame.global_intent}\n\nPLAN: {self.frame.plan}\n\n"
+            f"{prior}LATEST WORKER REPORTS:\n{reports_text}\n\nProduce the JSON decision."
         )
 
-    def _dispatch_tool(self, fn_name: str, args: dict, current_worker_id: str, child_reports: list, mutations: list) -> str:
-        if fn_name == "locate_file":
-            return self.locate_file(file_name=args.get("file_name", ""))
-        elif fn_name == "read_surgical_lines":
-            return self.read_surgical_lines(
-                file_name=args.get("file_name", ""),
-                start_line=args.get("start_line", 1),
-                end_line=args.get("end_line", 30)
+        text = self._chat(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=2500,
+        )
+        data = self._extract_json(text)
+        if not data:
+            self.frame.synthesis = text
+            return {"status": "DONE", "workers": []}
+
+        self.frame.synthesis = str(data.get("summary", text))
+        status = str(data.get("status", "DONE")).upper()
+        return {"status": status, "workers": self._clean_workers(data.get("workers"))}
+
+    def save_session(self):
+        session_data = {
+            "frame": self.frame.to_dict(),
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
+            "session_file": self.session_file,
+        }
+        Path(self.session_file).write_text(json.dumps(session_data, indent=2), encoding="utf-8")
+        print(f"\n[Session saved to: {self.session_file}]")
+
+    def load_session(self, path: str = None) -> bool:
+        """Restore a saved session so a new run can continue from it."""
+        p = Path(path or self.session_file)
+        if not p.exists():
+            return False
+        data = json.loads(p.read_text(encoding="utf-8"))
+        f = data.get("frame", {})
+        self.frame = WorkingFrame(
+            global_intent=f.get("global_intent", ""),
+            plan=f.get("plan", ""),
+            findings=f.get("findings", ""),
+            next_tasks=f.get("next_tasks", ""),
+            synthesis=f.get("synthesis", ""),
+            child_reports=[ChildReport(**r) for r in f.get("child_reports", [])],
+            awareness_state=f.get("awareness_state", "PLANNING"),
+        )
+        self.total_prompt_tokens = data.get("total_prompt_tokens", 0)
+        self.total_completion_tokens = data.get("total_completion_tokens", 0)
+        return True
+
+    def execute_plan(self, user_question: str) -> str:
+        workers = self.create_intelligent_plan(user_question)
+
+        for rnd in range(1, MAX_ROUNDS + 1):
+            self.frame.awareness_state = f"EXECUTING_ROUND_{rnd}"
+            print(f"[EXECUTION PHASE - Round {rnd}, {len(workers)} worker(s)]")
+
+            round_reports = []
+            for i, w in enumerate(workers, 1):
+                report = self.spawn_worker(
+                    worker_id=f"W{rnd}.{i}",
+                    task=w["task"],
+                    target_files=w["files"],
+                    can_write=w["write"],
+                    context=self.frame.synthesis if rnd > 1 else "",
+                )
+                round_reports.append(report)
+
+            self.frame.awareness_state = "SYNTHESIZING"
+            print("\n[SYNTHESIS PHASE]\n")
+            decision = self.synthesize(round_reports)
+            if any(r.status == "COMPLETED" and looks_like_tool_markup(r.findings) for r in round_reports):
+                print("[WARN] a worker's final report is raw tool markup; parsing failed")
+
+            if decision["status"] != "CONTINUE" or not decision["workers"]:
+                break
+            if rnd == MAX_ROUNDS:
+                self.frame.synthesis += "\n\n[round limit reached; work may remain]"
+                break
+            workers = decision["workers"]
+            self.frame.next_tasks = "\n".join(
+                f"{i}. {'[WRITE] ' if w['write'] else ''}{w['task']}"
+                for i, w in enumerate(workers, 1)
             )
-        elif fn_name == "list_service_files":
-            return json.dumps(self.list_service_files(args.get("service_name", "")))
-        elif fn_name == "spawn_child_worker":
-            child_req = FrameSpawnRequest(
-                child_id=f"{current_worker_id}.{len(child_reports) + 1}",
-                parent_id=current_worker_id,
-                target_scope=args.get("target_scope", ""),
-                sub_goal=args.get("sub_goal", ""),
-                expected_deliverable=args.get("expected_deliverable", "")
-            )
-            child_res = self.spawn_frame(child_req)
-            child_reports.append(child_res.model_dump())
-            mutations.extend(child_res.mutations_applied)
-            return f"Child [{child_res.child_id}] finished. Result: {child_res.scalar_deduction}"
-        elif fn_name == "write_file":
-            res = self.write_file(
-                file_name=args.get("file_name", ""),
-                content=args.get("content", ""),
-                reason=args.get("reason", "")
-            )
-            mutations.append(args.get("file_name", ""))
-            return res
-        elif fn_name == "apply_code_patch":
-            res = self.apply_code_patch(
-                file_name=args.get("file_name", ""),
-                target_snippet=args.get("target_snippet", ""),
-                replacement_snippet=args.get("replacement_snippet", ""),
-                reason=args.get("reason", "")
-            )
-            mutations.append(args.get("file_name", ""))
-            return res
-        elif fn_name == "rollback_file":
-            return self.rollback_file(file_name=args.get("file_name", ""))
-        elif fn_name == "update_hypothesis":
-            return self.update_hypothesis(hypothesis=args.get("hypothesis", ""))
-        elif fn_name == "get_working_frame":
-            return self.frame.render()
-        return f"Error: Tool '{fn_name}' not recognized."
+
+        self.frame.awareness_state = "SESSION_SAVED"
+        print(self.frame.render())
+        total = self.total_prompt_tokens + self.total_completion_tokens
+        print(
+            f"[Telemetry] Prompt: {self.total_prompt_tokens} | "
+            f"Completion: {self.total_completion_tokens} | Total: {total}"
+        )
+        self.save_session()
+
+        return self.frame.synthesis or "Execution complete. Session saved for continuation."
 
     def investigate(self, user_question: str) -> str:
-        self.frame = WorkingFrame()
-        self.frame.global_intent = user_question
-        self.frame.awareness_state = "ORIENT"
-        self.frame.last_action = "(Investigation booted)"
-
-        self.total_prompt_tokens = 0
-        self.total_completion_tokens = 0
-        self.inspected_cache = set()
-
-        services = self.list_services()
-        root_scope = (
-            f"Available Services: {', '.join(services)}\n"
-            f"Project Root: {self.root.name}"
-        )
-
-        root_req = FrameSpawnRequest(
-            child_id="W1",
-            parent_id="ROOT",
-            target_scope=root_scope,
-            sub_goal=user_question,
-            expected_deliverable="Clear report of findings and actions taken."
-        )
-
-        root_res = self.spawn_frame(root_req)
-
-        total_tokens = self.total_prompt_tokens + self.total_completion_tokens
-        print(f"\n[Telemetry] Prompt: {self.total_prompt_tokens} | Completion: {self.total_completion_tokens} | Total: {total_tokens}")
-        print("\n[Final Working Frame]\n" + self.frame.render())
-
-        return root_res.scalar_deduction
+        return self.execute_plan(user_question)
