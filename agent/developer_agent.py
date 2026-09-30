@@ -8,42 +8,68 @@ from datetime import datetime
 from agent.key_manager import GroqKeyRotator
 from engine.ast_indexer import ASTIndexer
 
-MAX_TOOL_CHARS = 6000
-MAX_CONTEXT_CHARS = 16000   # ~4.5k tokens, stays under the 7k/min input limit
-MAX_OUT_TOKENS = 1000       # some keys allow only 1000 output tokens/min
-MAX_WORKER_TURNS = 12
+# ------------------------------------------------------------------ limits
+MAX_TOOL_CHARS = 6000        # cap on grep / list results fed to a navigator
+MAX_SKELETON_CHARS = 30000   # cap per file skeleton
+MAX_CONTEXT_CHARS = 26000    # navigator context budget (older grep/list results get dropped)
+MAX_READER_CHARS = 14000     # max code shown to one leaf
+MAX_OUT_TOKENS = 1000        # some keys allow only 1000 output tokens/min
+MAX_WORKER_TURNS = 10
 MAX_ROUNDS = 3
 MAX_WORKERS_PER_ROUND = 8
 MAX_GREP_HITS = 60
 MAX_FILES_PER_WORKER = 2
 
-TOOL_RE = re.compile(r"TOOL:\s*(\w+)\(([^)]*)\)")
+TOOL_NAMES = ("skeleton", "read", "refs", "grep", "list_files",
+              "edit", "replace_preview", "replace_all")
+ALIASES = {"get_file_skeleton": "skeleton", "grep_files": "grep"}
+LINE_TOOL_RE = re.compile(r"^\s*(?:[-*]\s*)?TOOL:\s*(\w+)\((.*)\)\s*$", re.MULTILINE)
 WRITE_RE = re.compile(
     r"WRITE_FILE:\s*(\S+)[ \t]*\r?\n```[\w+-]*\r?\n(.*?)\r?\n```",
     re.DOTALL,
 )
-TOOL_NAMES = ("read_file", "get_file_skeleton", "list_files", "grep_files",
-              "replace_preview", "replace_all")
+FENCE_RE = re.compile(r"```[\w+-]*[ \t]*\r?\n(.*?)```", re.DOTALL)
 TEXT_EXTS = {".java", ".xml", ".yml", ".yaml", ".properties", ".json", ".gradle", ".md", ".sql"}
 SKIP_DIRS = {"target", "build", ".git", ".idea", "node_modules", ".cognitive_backup"}
 
+TOOLS_HELP = (
+    "Valid tools (one per line, single-line arguments, ' | ' separates parts): "
+    "TOOL: skeleton(file) | TOOL: read(file | ranges | question) | TOOL: refs(file | ranges) | "
+    "TOOL: grep(pattern) | TOOL: list_files(dir) | TOOL: edit(file | range | instruction)"
+)
+
+
+def looks_like_tool_markup(msg: str) -> bool:
+    return any(s in msg for s in ("<tool_call>", "<function", "TOOL:"))
+
+
 def parse_tool_calls(msg: str, limit: int = 4):
-    """Return a list of (name, arg) from any tool-call format."""
+    """Return a list of (name, arg). Line format: TOOL: name(arg). Falls back to
+    the model's native markup for the simple single-argument tools."""
     calls = []
-    for m in re.finditer(r"TOOL:\s*(\w+)\(([^)]*)\)", msg):
-        if m.group(1) in TOOL_NAMES:
-            calls.append((m.group(1), m.group(2).strip().strip("'\"")))
+    for m in LINE_TOOL_RE.finditer(msg):
+        name = ALIASES.get(m.group(1), m.group(1))
+        if name in TOOL_NAMES:
+            calls.append((name, m.group(2).strip()))
     if calls:
         return calls[:limit]
 
     if looks_like_tool_markup(msg):
+        # native markup or a missing ')' : accept  read(a | b | c  /  edit(a | b | c)
+        for m in re.finditer(r"\b(read|refs|edit|replace_preview|replace_all)\(([^\n<]*)", msg):
+            arg = m.group(2).strip()
+            if arg.endswith(")"):
+                arg = arg[:-1].strip()
+            if arg:
+                calls.append((m.group(1), arg))
+        if calls:
+            return calls[:limit]
+
         seen = set()
-        for m in re.finditer(r"\b(" + "|".join(TOOL_NAMES) + r")\b", msg):
-            name = m.group(1)
-            if name in ("replace_preview", "replace_all"):
-                continue 
-            tail = msg[m.end():]
-            if name == "grep_files":
+        for m in re.finditer(r"\b(skeleton|get_file_skeleton|list_files|grep|grep_files)\b", msg):
+            name = ALIASES.get(m.group(1), m.group(1))
+            tail = re.sub(r"</?parameter[^>]*>", " ", msg[m.end():])
+            if name == "grep":
                 g = re.match(r"[^\w\\/.^(\[]*([^<\n]+?)\s*(?:</|\)|\n|$)", tail)
             else:
                 g = re.match(r"[^\w./\\-]*([\w./\\-]+)", tail)
@@ -52,10 +78,6 @@ def parse_tool_calls(msg: str, limit: int = 4):
                 seen.add((name, arg))
                 calls.append((name, arg))
     return calls[:limit]
-
-
-def looks_like_tool_markup(msg: str) -> bool:
-    return any(s in msg for s in ("<tool_call>", "<function", "TOOL:"))
 
 
 @dataclass
@@ -125,6 +147,13 @@ class WorkingFrame:
 
 
 class DeveloperAgent:
+    """
+    Level 1  Orchestrator : plans, delegates goals, synthesizes.
+    Level 2  Navigator    : sees the SKELETON of its files (outline + line ranges), plans,
+                            delegates exact line ranges to level 3, never reads code itself.
+    Level 3  Reader/Writer: single LLM call, code preloaded, NO tools. Cannot spawn anything.
+    """
+
     def __init__(
         self,
         project_root: str,
@@ -142,9 +171,14 @@ class DeveloperAgent:
         self.file_index: Dict[str, List[Path]] = {}
         self.target_services: set = set()
         self.session_file = session_file or "cognitive_os_session.json"
+        self.backup_root = self._new_backup_root()
+        self._backed_up: set = set()
         self._build_index()
 
     # ------------------------------------------------------------------ infra
+
+    def _new_backup_root(self) -> Path:
+        return self.root / ".cognitive_backup" / datetime.now().strftime("%Y%m%d_%H%M%S")
 
     def _reset(self):
         """Every question starts from zero: no frame, no reports, no synthesis, no target services."""
@@ -152,12 +186,21 @@ class DeveloperAgent:
         self.target_services = set()
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        self.backup_root = self._new_backup_root()
+        self._backed_up = set()
         self._build_index()   # re-scan disk so files changed since the last question are seen
+
+    def _skip(self, p: Path) -> bool:
+        try:
+            parts = p.relative_to(self.root).parts
+        except Exception:
+            parts = p.parts
+        return any(part in SKIP_DIRS or part == "test" for part in parts)
 
     def _build_index(self):
         self.file_index.clear()
         for p in self.root.rglob("*.java"):
-            if "test" not in p.parts and "target" not in p.parts:
+            if not self._skip(p):
                 self.file_index.setdefault(p.name.lower(), []).append(p)
 
     def list_services(self) -> List[str]:
@@ -208,12 +251,6 @@ class DeveloperAgent:
         except Exception:
             return None
 
-    @staticmethod
-    def _cap(text: str) -> str:
-        if len(text) <= MAX_TOOL_CHARS:
-            return text
-        return text[:MAX_TOOL_CHARS] + f"\n...[truncated, {len(text)} chars total]"
-
     def _chat_json(self, messages, max_tokens: int = MAX_OUT_TOKENS):
         """Returns (data, text). Retries once with a compact-output instruction if JSON is cut off."""
         text = self._chat(messages, max_tokens=max_tokens)
@@ -228,6 +265,79 @@ class DeveloperAgent:
         text = self._chat(retry, max_tokens=max_tokens)
         return self._extract_json(text), text
 
+    @staticmethod
+    def _cap(text: str, limit: int = MAX_TOOL_CHARS) -> str:
+        if len(text) <= limit:
+            return text
+        return text[:limit] + f"\n...[truncated, {len(text)} chars total]"
+
+    # --------------------------------------------------------------- file utils
+
+    @staticmethod
+    def _read_lines(path: Path, strict: bool = False) -> Tuple[List[str], str]:
+        """(lines, newline). Lines have no line endings. Last element is '' if the file
+        ends with a newline, so len(lines) may be one more than the real line count."""
+        raw = path.read_bytes()
+        text = raw.decode("utf-8") if strict else raw.decode("utf-8", errors="ignore")
+        nl = "\r\n" if "\r\n" in text else "\n"
+        return text.replace("\r\n", "\n").split("\n"), nl
+
+    @staticmethod
+    def _n(lines: List[str]) -> int:
+        return len(lines) - 1 if lines and lines[-1] == "" else len(lines)
+
+    @staticmethod
+    def _parse_ranges(spec: str, n: int) -> List[Tuple[int, int]]:
+        spec = spec.strip().strip("'\"")
+        if n <= 0:
+            return []
+        if spec.lower() in ("all", "*", "whole"):
+            return [(1, n)]
+        rs = []
+        for m in re.finditer(r"(\d+)\s*-\s*(\d+)|(\d+)", spec):
+            if m.group(3):
+                a = b = int(m.group(3))
+            else:
+                a, b = int(m.group(1)), int(m.group(2))
+            if a > b:
+                a, b = b, a
+            a, b = max(1, a), min(n, b)
+            if a <= b:
+                rs.append((a, b))
+        rs.sort()
+        merged: List[Tuple[int, int]] = []
+        for a, b in rs:
+            if merged and a <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+            else:
+                merged.append((a, b))
+        return merged
+
+    def _backup(self, path: Path):
+        """Copy the original once per question into .cognitive_backup/<timestamp>/."""
+        if path in self._backed_up or not path.exists():
+            return
+        dest = self.backup_root / path.relative_to(self.root)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(path.read_bytes())
+        self._backed_up.add(path)
+
+    def _change_report(self) -> str:
+        """Unified diff of every file changed this question (backup vs disk). Zero tokens, no trust in worker claims."""
+        import difflib
+        out = []
+        for p in sorted(self._backed_up):
+            bak = self.backup_root / p.relative_to(self.root)
+            try:
+                a = bak.read_text(encoding="utf-8", errors="ignore").splitlines()
+                b = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except Exception:
+                continue
+            d = list(difflib.unified_diff(a, b, f"a/{self._rel(p)}", f"b/{self._rel(p)}", lineterm="", n=1))
+            if d:
+                out.append("\n".join(d))
+        return self._cap("\n\n".join(out) or "(no files changed)", 8000)
+
     def _text_files(self):
         for p in self.root.rglob("*"):
             if not p.is_file() or p.suffix.lower() not in TEXT_EXTS:
@@ -239,61 +349,6 @@ class DeveloperAgent:
             if any(part in SKIP_DIRS for part in parts):
                 continue
             yield p
-
-    @staticmethod
-    def _split_pair(arg: str):
-        for sep in ("=>", "->", "|"):
-            if sep in arg:
-                a, b = arg.split(sep, 1)
-                return a.strip().strip("'\""), b.strip().strip("'\"")
-        return None, None
-
-    def replace_in_repo(self, arg: str, apply: bool) -> str:
-        """Deterministic repo-wide literal replace. apply=False is a dry run."""
-        old, new = self._split_pair(arg)
-        if not old or new is None or old == new:
-            return "ERROR: use  old => new"
-        if len(old) < 3:
-            return "ERROR: 'old' must be at least 3 characters."
-
-        backup_root = self.root / ".cognitive_backup" / datetime.now().strftime("%Y%m%d_%H%M%S")
-        changed, total, by_ext = [], 0, {}
-        for p in self._text_files():
-            try:
-                raw = p.read_bytes()
-                text = raw.decode("utf-8")
-            except Exception:
-                continue
-            n = text.count(old)
-            if not n:
-                continue
-            total += n
-            changed.append(self._rel(p))
-            by_ext[p.suffix.lower()] = by_ext.get(p.suffix.lower(), 0) + n
-            if apply:
-                bp = backup_root / p.relative_to(self.root)
-                bp.parent.mkdir(parents=True, exist_ok=True)
-                bp.write_bytes(raw)
-                p.write_bytes(text.replace(old, new).encode("utf-8"))
-
-        ext_s = ", ".join(f"{k}:{v}" for k, v in sorted(by_ext.items())) or "none"
-        sample = "\n".join(changed[:20]) + (f"\n...+{len(changed) - 20} more" if len(changed) > 20 else "")
-        head = "APPLIED" if apply else "PREVIEW (nothing written)"
-        out = f"{head}: '{old}' -> '{new}': {total} occurrence(s) in {len(changed)} file(s) [by type: {ext_s}]\n{sample}"
-
-        if apply:
-            self._build_index()
-            resid = []
-            for p in self._text_files():
-                try:
-                    if old.lower() in p.read_text(encoding="utf-8", errors="ignore").lower():
-                        resid.append(self._rel(p))
-                except Exception:
-                    pass
-            out += f"\nBackups: {self._rel(backup_root)}"
-            out += f"\nREMAINING case-insensitive matches of '{old}': {len(resid)} file(s) {resid[:10]}"
-            out += f"\nREPO OVERVIEW AFTER:\n{self._repo_overview()}"
-        return out
 
     # ------------------------------------------------------------------ tools
 
@@ -324,26 +379,23 @@ class DeveloperAgent:
             return None, f"Ambiguous '{name}'. Use one of: {opts}"
         return None, f"Error: File '{name}' not found in repo."
 
-    def read_file(self, file_name: str) -> str:
-        path, err = self._resolve(file_name)
-        if err:
-            return err
+    def _skeleton_text(self, path: Path) -> str:
         try:
-            content = path.read_text(encoding="utf-8", errors="ignore")
-            if not content.strip():
-                return f"[EMPTY FILE] {self._rel(path)} is empty (0 bytes)"
-            return self._cap(f"[{self._rel(path)}]\n{content}")
+            return self._cap(self.indexer.generate_skeleton(path), MAX_SKELETON_CHARS)
         except Exception as e:
-            return f"Error reading file: {e}"
+            return f"Error building skeleton: {e}"
 
-    def get_file_skeleton(self, file_name: str) -> str:
-        path, err = self._resolve(file_name)
-        if err:
-            return err
-        try:
-            return self._cap(self.indexer.generate_skeleton(path))
-        except Exception as e:
-            return f"Error: {e}"
+    def _skeleton_block(self, files: List[Path]) -> str:
+        if not files:
+            return ""
+        out = ["\n\nCURRENT SKELETONS (always up to date; 'a-b' are line ranges):"]
+        for p in files:
+            try:
+                n = self._n(self._read_lines(p)[0])
+            except Exception:
+                n = "?"
+            out.append(f"\n[{self._rel(p)}] ({n} lines)\n{self._skeleton_text(p)}")
+        return "\n".join(out)
 
     def list_files(self, directory: str = "") -> str:
         directory = directory.strip().strip("'\"").replace("\\", "/").lstrip("/")
@@ -354,11 +406,7 @@ class DeveloperAgent:
         if base is None:
             return (f"Error: directory '{directory}' not found. "
                     f"Services: {', '.join(self.list_services())}")
-        files = []
-        for p in sorted(base.rglob("*.java")):
-            if "test" in p.parts or "target" in p.parts:
-                continue
-            files.append(self._rel(p))
+        files = [self._rel(p) for p in sorted(base.rglob("*.java")) if not self._skip(p)]
         return self._cap("\n".join(files)) if files else "(no java files)"
 
     def grep_files(self, pattern: str) -> str:
@@ -370,15 +418,12 @@ class DeveloperAgent:
         except re.error:
             rx = re.compile(re.escape(pattern))
 
-        if self.target_services:
-            roots = [self.root / s for s in sorted(self.target_services)]
-        else:
-            roots = [self.root]
+        roots = [self.root / s for s in sorted(self.target_services)] if self.target_services else [self.root]
 
         hits = []
         for base in roots:
             for p in base.rglob("*.java"):
-                if "test" in p.parts or "target" in p.parts:
+                if self._skip(p):
                     continue
                 try:
                     for i, line in enumerate(
@@ -393,7 +438,206 @@ class DeveloperAgent:
                     continue
         return "\n".join(hits) if hits else "(no matches)"
 
+    # ------------------------------------------- level-3 leaves (single LLM call)
+
+    def _class_context(self, path: Path, ranges: List[Tuple[int, int]]) -> str:
+        """Declarations (from elsewhere in the file) that the ranges refer to. Deterministic."""
+        if path.suffix != ".java":
+            return ""
+        try:
+            idx = self.indexer.parse(path)
+        except Exception:
+            return ""
+        fields, methods = {}, {}
+        for a, b in ranges:
+            f, m = self.indexer.references(path, a, b, idx)
+            for x in f:
+                fields[(x.start, x.end)] = x
+            for x in m:
+                methods[(x.start, x.end)] = x
+
+        def inside(x):
+            return any(a <= x.start and x.end <= b for a, b in ranges)
+
+        lines = []
+        for x in sorted(fields.values(), key=lambda x: x.start):
+            if not inside(x):
+                lines.append(f"  field  {x.start}-{x.end}: {x.head}")
+        for x in sorted(methods.values(), key=lambda x: x.start):
+            if not inside(x):
+                lines.append(f"  method {x.start}-{x.end}: {x.head}")
+        return "\n".join(lines[:40])
+
+    @staticmethod
+    def _numbered(lines: List[str], ranges: List[Tuple[int, int]], rel: str) -> str:
+        blocks = []
+        for a, b in ranges:
+            body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(a, b + 1))
+            blocks.append(f"--- {rel} lines {a}-{b} ---\n{body}")
+        return "\n\n".join(blocks)
+
+    def tool_read(self, arg: str) -> str:
+        """Level-3 READER: preloaded ranges, one LLM call, no tools."""
+        parts = [p.strip().strip("'\"") for p in arg.split("|", 2)]
+        if len(parts) < 3 or not parts[2]:
+            return "ERROR: use read(file | ranges | question)   e.g. read(A.java | 10-20, 40-45 | what does foo validate?)"
+        path, err = self._resolve(parts[0])
+        if err:
+            return err
+        try:
+            lines, _ = self._read_lines(path)
+        except Exception as e:
+            return f"Error reading file: {e}"
+        n = self._n(lines)
+        ranges = self._parse_ranges(parts[1], n)
+        if not ranges:
+            return f"ERROR: bad ranges '{parts[1]}' (file has {n} lines). Use e.g. 10-20, 40-45 or all."
+
+        rel = self._rel(path)
+        code = self._cap(self._numbered(lines, ranges, rel), MAX_READER_CHARS)
+        ctx = self._class_context(path, ranges)
+
+        system_prompt = (
+            "You are a code reader. You see ONLY the line ranges below, taken from one file. "
+            "You cannot see the rest of the file and you have no tools.\n"
+            "Answer the QUESTION strictly from the code shown. Never guess about code you cannot see.\n"
+            "Reply in exactly this format and nothing else:\n"
+            "ANSWER: <direct, concise answer>\n"
+            "EVIDENCE: <up to 8 lines, each 'LINE: code' copied from the shown code>\n"
+            "LEADS: <methods/types/classes the code uses that are defined elsewhere, as 'name (line N)'; or NONE>\n"
+            "COVERAGE: FOUND IN RANGE | NOT IN RANGE (say what is missing)"
+        )
+        user = f"FILE: {rel}\nQUESTION: {parts[2]}\n\nCODE (line-number prefixes are not part of the code):\n{code}"
+        if ctx:
+            user += ("\n\nCLASS CONTEXT (declarations elsewhere in the file that the code refers to; "
+                     f"NOT part of your ranges):\n{ctx}")
+        answer = self._chat(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user}],
+            max_tokens=MAX_OUT_TOKENS,
+        )
+        if not answer or looks_like_tool_markup(answer):
+            answer = "ANSWER: (reader produced no usable answer)\nCOVERAGE: UNKNOWN"
+        spans = ", ".join(f"{a}-{b}" for a, b in ranges)
+        return f"[reader {rel} lines {spans}]\n{answer}"
+
+    def tool_refs(self, arg: str) -> str:
+        """Deterministic usage map for line ranges (no LLM)."""
+        parts = [p.strip().strip("'\"") for p in arg.split("|", 1)]
+        if len(parts) < 2:
+            return "ERROR: use refs(file | ranges)"
+        path, err = self._resolve(parts[0])
+        if err:
+            return err
+        if path.suffix != ".java":
+            return "ERROR: refs works on .java files only."
+        n = self._n(self._read_lines(path)[0])
+        ranges = self._parse_ranges(parts[1], n)
+        if not ranges:
+            return f"ERROR: bad ranges '{parts[1]}' (file has {n} lines)."
+        ctx = self._class_context(path, ranges)
+        spans = ", ".join(f"{a}-{b}" for a, b in ranges)
+        return f"[refs {self._rel(path)} lines {spans}]\n" + (ctx or "(no references to other members of this file)")
+
+    def tool_edit(self, arg: str) -> str:
+        """Level-3 WRITER: replaces exactly one line range. Harness applies + validates + reports."""
+        parts = [p.strip().strip("'\"") for p in arg.split("|", 2)]
+        if len(parts) < 3 or not parts[2]:
+            return "ERROR: use edit(file | range | instruction)"
+        path, err = self._resolve(parts[0], fuzzy=False)
+        if err:
+            return err
+        try:
+            lines, nl = self._read_lines(path, strict=True)
+        except Exception as e:
+            return f"ERROR: cannot edit (file is not valid UTF-8 or unreadable): {e}"
+        n = self._n(lines)
+        ranges = self._parse_ranges(parts[1], n)
+        if len(ranges) != 1:
+            return "ERROR: edit needs exactly ONE contiguous range, e.g. edit(A.java | 18-24 | instruction)"
+        a, b = ranges[0]
+        rel = self._rel(path)
+        is_java = path.suffix == ".java"
+
+        old_text_bytes = path.read_bytes()
+        old_err = self.indexer.syntax_error(old_text_bytes) if is_java else None
+        old_skel = self.indexer.generate_skeleton(path).splitlines() if is_java else []
+
+        code = self._cap(self._numbered(lines, [(a, b)], rel), MAX_READER_CHARS)
+        ctx = self._class_context(path, [(a, b)])
+        skel = self._cap(self.indexer.generate_skeleton(path), 12000) if is_java else ""
+
+        system_prompt = (
+            f"You are a code editor. Replace EXACTLY lines {a}-{b} of the file with new text.\n"
+            "Follow the INSTRUCTION. Keep everything in the range that the instruction does not change. "
+            "Match the file's indentation and style. Include annotations that belong to the range.\n"
+            "Output ONLY one fenced code block containing the full replacement text for those lines "
+            "(no line-number prefixes, no explanation). To delete the lines, output an empty block."
+        )
+        user = f"FILE: {rel}\nINSTRUCTION: {parts[2]}\n\nLINES TO REPLACE:\n{code}"
+        if ctx:
+            user += f"\n\nCLASS CONTEXT (elsewhere in the file, do not output these):\n{ctx}"
+        if skel:
+            user += f"\n\nFILE OUTLINE (for reference, do not output):\n{skel}"
+
+        msg = self._chat(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user}],
+            max_tokens=MAX_OUT_TOKENS,
+        )
+        fm = FENCE_RE.search(msg)
+        if not fm:
+            return ("ERROR: writer returned no complete code block (output may have been cut off). "
+                    "Nothing was changed. Retry on a smaller range or with a simpler instruction.")
+        body = fm.group(1)
+        body_lines = body.replace("\r\n", "\n").split("\n")
+        if body_lines and body_lines[-1] == "":
+            body_lines.pop()
+        # strip accidental 'N: ' line-number prefixes copied from the prompt
+        if body_lines and all(re.match(r"^\d+: ?", l) for l in body_lines if l.strip()):
+            body_lines = [re.sub(r"^\d+: ?", "", l) for l in body_lines]
+
+        new_lines = lines[: a - 1] + body_lines + lines[b:]
+        new_text = nl.join(new_lines)
+        new_bytes = new_text.encode("utf-8")
+
+        if is_java:
+            new_err = self.indexer.syntax_error(new_bytes)
+            if new_err and not old_err:
+                return (f"REJECTED: the edit would introduce a syntax error ({new_err}). "
+                        "Nothing was changed. Fix the instruction or the range and retry.")
+
+        self._backup(path)
+        path.write_bytes(new_bytes)
+        self._build_index()
+
+        delta = len(body_lines) - (b - a + 1)
+        report = [
+            f"EDITED {rel} lines {a}-{b} -> {len(body_lines)} line(s) (delta {delta:+d}). "
+            + ("Syntax OK." if is_java and not (self.indexer.syntax_error(new_bytes)) else
+               ("WARNING: file still has syntax errors." if is_java else "")),
+        ]
+        if is_java:
+            new_skel = self.indexer.generate_skeleton(path).splitlines()
+            strip = lambda s: re.sub(r"\s+\d+-\d+$", "", s)
+            old_set, new_set = {strip(s) for s in old_skel}, {strip(s) for s in new_skel}
+            added = [s for s in new_skel if strip(s) not in old_set]
+            removed = [s.strip() for s in old_skel if strip(s) not in new_set]
+            if added:
+                report.append("NEW/CHANGED outline entries:\n" + "\n".join(f"  {s.strip()}" for s in added[:15]))
+            if removed:
+                report.append("REMOVED outline entries:\n" + "\n".join(f"  {s}" for s in removed[:10]))
+            if delta:
+                report.append(f"Everything after line {b} moved by {delta:+d}. The CURRENT SKELETONS block already reflects this.")
+        new_n = self._n(new_lines)
+        s2, e2 = a, min(new_n, a + max(len(body_lines), 1) - 1)
+        if body_lines:
+            preview = "\n".join(f"{i}: {new_lines[i - 1]}" for i in range(s2, min(e2, s2 + 60) + 1))
+            report.append(f"READBACK:\n{preview}")
+        return "\n".join(report)
+
+    # ------------------------------------------------------- whole-file writes
+
     def write_file(self, file_name: str, content: str) -> str:
+        """Create a new file or fully overwrite one (used for new/empty files)."""
         path, err = self._resolve(file_name, fuzzy=False)
         if err:
             if err.startswith("Ambiguous"):
@@ -412,12 +656,18 @@ class DeveloperAgent:
             return "ERROR: path outside repo."
 
         try:
+            nl = "\n"
             if path.exists():
-                old = path.read_text(encoding="utf-8", errors="ignore")
-                if old.strip():
-                    path.with_suffix(path.suffix + ".bak").write_text(old, encoding="utf-8")
+                self._backup(path)
+                if b"\r\n" in path.read_bytes():
+                    nl = "\r\n"
+            data = content.replace("\r\n", "\n").replace("\n", nl)
+            if path.suffix == ".java":
+                serr = self.indexer.syntax_error(data.encode("utf-8"))
+                if serr:
+                    return f"REJECTED: content has a syntax error ({serr}). Nothing was written."
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
+            path.write_bytes(data.encode("utf-8"))
         except Exception as e:
             return f"ERROR writing file: {e}"
 
@@ -431,10 +681,61 @@ class DeveloperAgent:
             if pkg.group(1) != expected:
                 warn = f"\nWARNING: package '{pkg.group(1)}' does not match folder '{expected}'"
 
-        return (
-            f"WROTE {self._rel(path)} ({len(content.splitlines())} lines){warn}\n"
-            f"READBACK:\n{self.read_file(self._rel(path))}"
-        )
+        return f"WROTE {self._rel(path)} ({len(content.splitlines())} lines){warn}"
+
+    # ------------------------------------------------- deterministic repo tools
+
+    @staticmethod
+    def _split_pair(arg: str):
+        for sep in ("=>", "->", "|"):
+            if sep in arg:
+                a, b = arg.split(sep, 1)
+                return a.strip().strip("'\""), b.strip().strip("'\"")
+        return None, None
+
+    def replace_in_repo(self, arg: str, apply: bool) -> str:
+        """Deterministic repo-wide literal replace. apply=False is a dry run."""
+        old, new = self._split_pair(arg)
+        if not old or new is None or old == new:
+            return "ERROR: use  old => new"
+        if len(old) < 3:
+            return "ERROR: 'old' must be at least 3 characters."
+
+        changed, total, by_ext = [], 0, {}
+        for p in self._text_files():
+            try:
+                raw = p.read_bytes()
+                text = raw.decode("utf-8")
+            except Exception:
+                continue
+            n = text.count(old)
+            if not n:
+                continue
+            total += n
+            changed.append(self._rel(p))
+            by_ext[p.suffix.lower()] = by_ext.get(p.suffix.lower(), 0) + n
+            if apply:
+                self._backup(p)
+                p.write_bytes(text.replace(old, new).encode("utf-8"))
+
+        ext_s = ", ".join(f"{k}:{v}" for k, v in sorted(by_ext.items())) or "none"
+        sample = "\n".join(changed[:20]) + (f"\n...+{len(changed) - 20} more" if len(changed) > 20 else "")
+        head = "APPLIED" if apply else "PREVIEW (nothing written)"
+        out = f"{head}: '{old}' -> '{new}': {total} occurrence(s) in {len(changed)} file(s) [by type: {ext_s}]\n{sample}"
+
+        if apply:
+            self._build_index()
+            resid = []
+            for p in self._text_files():
+                try:
+                    if old.lower() in p.read_text(encoding="utf-8", errors="ignore").lower():
+                        resid.append(self._rel(p))
+                except Exception:
+                    pass
+            out += f"\nBackups: {self._rel(self.backup_root)}"
+            out += f"\nREMAINING case-insensitive matches of '{old}': {len(resid)} file(s) {resid[:10]}"
+            out += f"\nREPO OVERVIEW AFTER:\n{self._repo_overview()}"
+        return out
 
     # --------------------------------------------------------------- topology
 
@@ -444,7 +745,7 @@ class DeveloperAgent:
         for svc in self.list_services():
             dirs, pkgs, n = {}, {}, 0
             for p in (self.root / svc).rglob("*.java"):
-                if "test" in p.parts or "target" in p.parts:
+                if self._skip(p):
                     continue
                 n += 1
                 posix = p.as_posix()
@@ -464,7 +765,7 @@ class DeveloperAgent:
 
     @staticmethod
     def _trim_history(messages) -> bool:
-        """Drop oldest tool results until the context fits the budget."""
+        """Drop oldest grep/list results until the context fits. Reader/edit results are never dropped."""
         total = lambda: sum(len(m["content"]) for m in messages)
         trimmed = False
         for m in messages[2:]:
@@ -507,7 +808,7 @@ class DeveloperAgent:
             service_path = self.root / service
             lines = []
             for java_file in service_path.rglob("*.java"):
-                if "test" in java_file.parts or "target" in java_file.parts:
+                if self._skip(java_file):
                     continue
                 try:
                     rel = str(java_file.relative_to(service_path)).replace("\\", "/")
@@ -536,7 +837,36 @@ class DeveloperAgent:
 
         return "\n".join(facts)
 
-    # ---------------------------------------------------------------- workers
+    # ---------------------------------------------------- level 2: navigators
+
+    def _dispatch(self, name: str, arg: str, can_write: bool, known: List[Path]):
+        """Returns (result_text, mutated_files)."""
+        if name == "skeleton":
+            path, err = self._resolve(arg)
+            if err:
+                return err, False
+            if path.suffix != ".java":
+                return (f"{self._rel(path)} is not a Java file. Use "
+                        f"read({self._rel(path)} | all | question)."), False
+            if path not in known:
+                known.append(path)
+            return f"{self._rel(path)} is now in CURRENT SKELETONS (see the task message).", False
+        if name == "read":
+            return self.tool_read(arg), False
+        if name == "refs":
+            return self.tool_refs(arg), False
+        if name == "grep":
+            return self.grep_files(arg), False
+        if name == "list_files":
+            return self.list_files(arg), False
+        if name == "replace_preview":
+            return self.replace_in_repo(arg, apply=False), False
+        if name in ("edit", "replace_all"):
+            if not can_write:
+                return "ERROR: you do not have write permission.", False
+            res = self.tool_edit(arg) if name == "edit" else self.replace_in_repo(arg, apply=True)
+            return res, not res.startswith(("ERROR", "REJECTED"))
+        return f"Unknown tool: {name}. {TOOLS_HELP}", False
 
     def spawn_worker(
         self,
@@ -552,39 +882,59 @@ class DeveloperAgent:
         write_doc = ""
         if can_write:
             write_doc = """
-- To create or overwrite a file, reply with EXACTLY this format and nothing else:
-WRITE_FILE: <path or filename>
-```<language>
+- TOOL: edit(file | range | instruction)   (a level-3 editor replaces EXACTLY that one contiguous range; use the range from the CURRENT skeleton; the harness rejects edits that break the syntax)
+- TOOL: replace_preview(old => new)   (repo-wide literal replace, DRY RUN: counts per file type, writes nothing)
+- TOOL: replace_all(old => new)   (repo-wide literal replace in java/xml/yml/properties/json files; backs up originals; run replace_preview first and check the counts)
+- To create a NEW or EMPTY file, reply with EXACTLY this and nothing else:
+WRITE_FILE: <repo-relative path>
+```java
 <full file content>
 ```
-- TOOL: replace_all(old => new)   (repo-wide literal replace in java/xml/yml/properties/json files; backs up originals; run replace_preview first and check the counts)
-Before writing, read neighbouring/related files so your package, imports, naming and style
-match the codebase. Write complete files only, never fragments."""
+Editing rules: to insert a new member, edit the range of a neighbouring member and tell the editor to keep it and add the new member after it. To add an import, edit the import range. After each edit the skeleton updates automatically; verify important edits with read(...)."""
 
-        system_prompt = f"""You are Worker {worker_id}, a focused sub-agent working inside a code repository.
+        system_prompt = f"""You are Worker {worker_id}, a level-2 NAVIGATOR inside a code repository. You plan; you do not read code yourself.
 
-TOOLS (you may call up to 4 per message, one per line):
-- TOOL: read_file(filename_or_relative_path)
-- TOOL: get_file_skeleton(filename_or_relative_path)
-- TOOL: list_files(directory)   (directory relative to repo root, blank for all)
-- TOOL: grep_files(pattern)     (regex or literal; returns path:line: text){write_doc}
-- TOOL: replace_preview(old => new)   (repo-wide literal replace, DRY RUN: counts per file type, writes nothing)
+You are shown the SKELETON of your files: an outline with the line range of every member (annotations included). Imports are folded into one range. Lombok/Spring annotations can generate members that are not in the source, so never conclude "no constructor/getter" from the skeleton alone.
+To learn what code does, delegate to a level-3 reader: read(file | ranges | question). The reader sees ONLY those lines, answers your question, and is then discarded. Ask one precise question per read; give the smallest ranges that contain the answer; include the ranges of fields/constants the code uses (or call refs first).
+To inspect imports, read the import range with a specific question (e.g. which package does X come from?).
+Facts visible in the skeleton (member names, signatures, annotations, class/interface/enum) you may state directly. Behaviour and imports need a reader.
+Say "not in this file" only after the skeleton has covered the whole file.
+If the trail leaves your files (something defined elsewhere), do NOT chase it: report it as FOLLOW-UP.
+
+TOOLS (up to 4 per message, one per line, single-line arguments, ' | ' separates parts):
+- TOOL: read(file | ranges | question)   (ranges like 10-20, 40-45 or 'all')
+- TOOL: refs(file | ranges)   (deterministic: fields/methods of this file that those lines use, with their ranges)
+- TOOL: skeleton(file)   (add another .java file's skeleton to your view)
+- TOOL: grep(pattern)   (regex or literal; returns path:line: text)
+- TOOL: list_files(directory){write_doc}
 
 RULES:
-- Do only the assigned task. Read only what you need.
-- Base every claim on file contents you actually read; if something is missing or unclear, say so.
-- Finish with a complete, concrete report and NO tool call in that final message.
-- Tool calls must be written exactly as TOOL: name(arg). Do not use XML/<tool_call> tags.
-- Your final report must include the actual code/signatures you found, not a statement that you will read."""
+- Do only the assigned goal. Delegate the minimum reading needed.
+- Base every claim on the skeleton or on reader answers; if something is unknown, say so.
+- Finish with a report and NO tool call, in this format:
+FINDINGS: <concise answer to your goal / what you changed>
+EVIDENCE: <'file:line: code' lines that prove it>
+FOLLOW-UP: <one per line 'file | member | why', or NONE>
+- Tool calls must be written exactly as TOOL: name(arg). Do not use XML/<tool_call> tags."""
 
-        user_message = f"ASSIGNED FILES/SCOPE: {target_files or '(not specified)'}\n"
+        base_user = f"ASSIGNED FILES/SCOPE: {target_files or '(not specified)'}\n"
         if context:
-            user_message += f"\nCONTEXT FROM ORCHESTRATOR:\n{context}\n"
-        user_message += f"\nTASK: {task}"
+            base_user += f"\nCONTEXT FROM ORCHESTRATOR:\n{context}\n"
+        base_user += f"\nGOAL: {task}"
+
+        known: List[Path] = []
+        for f in re.split(r"[,\n]", target_files or ""):
+            f = f.strip()
+            if not f:
+                continue
+            p, err = self._resolve(f)
+            if p is not None and p.suffix == ".java" and p not in known:
+                known.append(p)
+        known = known[:4]
 
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
+            {"role": "user", "content": base_user},
         ]
 
         actions: List[str] = []
@@ -592,8 +942,10 @@ RULES:
         finished = False
         partial = False
         seen = set()
+        parse_fails = 0
 
         for _ in range(MAX_WORKER_TURNS):
+            messages[1]["content"] = base_user + self._skeleton_block(known)   # always fresh
             if self._trim_history(messages):
                 seen.clear()
             msg = self._chat(messages, max_tokens=MAX_OUT_TOKENS)
@@ -605,51 +957,55 @@ RULES:
                 if can_write:
                     result = self.write_file(w.group(1), w.group(2))
                     actions.append(result.split("\n")[0])
+                    if result.startswith("WROTE"):
+                        seen.clear()
+                        p, _err = self._resolve(w.group(1), fuzzy=False)
+                        if p is not None and p.suffix == ".java" and p not in known:
+                            known.append(p)
                 else:
                     result = "ERROR: you do not have write permission."
-                messages.append({"role": "user", "content": f"TOOL RESULT:\n{result}"})
+                messages.append({"role": "user", "content": f"RESULTS:\n{result}"})
                 continue
 
             calls = parse_tool_calls(msg)
             if calls:
-                outs = []
+                parse_fails = 0
+                outs, keep = [], False
                 for name, arg in calls:
                     key = (name, arg.lower())
                     if key in seen:
                         outs.append(f"[{name}({arg})] already returned above; do not repeat it.")
                         continue
                     seen.add(key)
-                    if name == "read_file":
-                        result = self.read_file(arg)
-                    elif name == "get_file_skeleton":
-                        result = self.get_file_skeleton(arg)
-                    elif name == "list_files":
-                        result = self.list_files(arg)
-                    elif name == "replace_preview":
-                        result = self.replace_in_repo(arg, apply=False)
-                    elif name == "replace_all":
-                        result = (self.replace_in_repo(arg, apply=True) if can_write
-                                  else "ERROR: you do not have write permission.")
-                    else:
-                        result = self.grep_files(arg)
+                    result, mutated = self._dispatch(name, arg, can_write, known)
+                    if name in ("read", "refs", "edit", "replace_all"):
+                        keep = True
+                    if mutated:
+                        seen.clear()
+                        actions.append(result.split("\n")[0][:160])
                     outs.append(f"[{name}({arg})]\n{result}")
-                messages.append({"role": "user", "content": "TOOL RESULT:\n" + "\n\n".join(outs)})
+                prefix = "RESULTS:\n" if keep else "TOOL RESULT:\n"
+                messages.append({"role": "user", "content": prefix + "\n\n".join(outs)})
                 continue
 
             if looks_like_tool_markup(msg):
+                parse_fails += 1
+                if parse_fails >= 3:
+                    break   # stop burning tokens; go to the forced wrap-up report
+                ex = self._rel(known[0]).rsplit("/", 1)[-1] if known else "File.java"
                 messages.append({"role": "user", "content":
-                    "TOOL ERROR: could not parse that call. Use one line per call: "
-                    "TOOL: read_file(path/to/File.java)"})
+                    "TOOL ERROR: could not parse that call. Write ONE line per call, starting with 'TOOL:' "
+                    f"and ending with ')', no XML tags. Example: TOOL: read({ex} | 10-20 | what does this code throw?)"})
                 continue
 
             finished = True
             break
 
         if not finished:
-            # budget exhausted: force a report from what was already read
+            # budget exhausted: force a report from what was already learned
             messages.append({"role": "user", "content":
-                "Tool budget exhausted. Write your final report NOW from what you already read. "
-                "Include actual code/signatures. NO tool calls."})
+                "Tool budget exhausted. Write your final report NOW from what you already learned, "
+                "in the FINDINGS / EVIDENCE / FOLLOW-UP format. NO tool calls."})
             msg = self._chat(messages, max_tokens=MAX_OUT_TOKENS)
             if msg and not looks_like_tool_markup(msg):
                 final = msg + "\n\n[partial: turn budget hit]"
@@ -667,7 +1023,7 @@ RULES:
         print(f"  Findings: {final[:300]}...\n")
         return report
 
-    # ----------------------------------------------------------- orchestration
+    # -------------------------------------------------- level 1: orchestration
 
     @staticmethod
     def _clean_workers(raw) -> List[dict]:
@@ -686,8 +1042,7 @@ RULES:
                 for i in range(0, len(flist), MAX_FILES_PER_WORKER):
                     chunk = flist[i:i + MAX_FILES_PER_WORKER]
                     workers.append({
-                        "task": f"{w['task']}\n(Focus ONLY on: {', '.join(chunk)}. "
-                                f"Report the actual contents/signatures you found.)",
+                        "task": f"{w['task']}\n(Focus ONLY on: {', '.join(chunk)}.)",
                         "files": ", ".join(chunk),
                         "write": False,
                     })
@@ -701,22 +1056,20 @@ RULES:
 
         topology = self._extract_topology_facts(user_question)
 
-        system_prompt = """You are the Orchestrator of a multi-agent developer system working on a code repository.
+        system_prompt = """You are the Orchestrator (level 1) of a multi-agent developer system working on a code repository.
 
-Given repository facts and a user goal, produce a plan and delegate work to child workers.
+Given repository facts and a user goal, produce a plan and delegate work to workers.
 
-Each worker has a fresh context and tools to read files, view skeletons, list files, grep, and (only if permitted) write files.
-Design workers so each has ONE narrow, self-contained task and reads only a few files.
-Grant "write": true only to workers whose task is to create or modify files, and only if the goal actually requires changes.
-If the goal only asks for analysis or explanation, use read-only workers.
-If the goal needs changes, first use read-only workers to gather what is needed; later rounds will handle edits.
+Each worker is a NAVIGATOR: it is shown the outline (skeleton with line ranges) of its assigned files and delegates the reading/editing of exact line ranges to tiny single-shot readers/editors. So give a worker a GOAL (what to find out or change) and up to 2 files. Do NOT tell workers to read whole files or to "list all methods"; state the question.
+Workers can also grep and list files. Grant "write": true only to workers whose goal is to create or modify files, and only if the goal actually requires changes.
+If the goal only asks for analysis or explanation, use read-only workers. If the goal needs changes to files that are named or easy to locate, give WRITE workers the whole job (they read what they need through readers, then edit). Use a separate read-only round only when the edit depends on information from files the writer would not see.
 Do not assume anything about files you have not been shown; have workers verify.
 
 HARD LIMIT: each worker gets at most 2 files. If a task needs more files, split it into several workers.
 Use file paths exactly as shown in the facts (relative to the service folder). Never guess folder names.
 
 If the facts/overview already answer the goal, return "workers": [] and put the answer in "answer".
-Otherwise use the FEWEST workers possible. For repo-wide questions about a name, package or string, use ONE worker that calls grep_files. Never list every service.
+Otherwise use the FEWEST workers possible. For repo-wide questions about a name, package or string, use ONE worker that calls grep. Never list every service.
 Keep the JSON compact: at most 4 workers, each task under 25 words, files as short paths.
 For repo-wide mechanical changes (renaming a package/word, replacing a string everywhere), use ONE write worker that runs replace_preview, then replace_all. Do NOT enumerate files or services.
 
@@ -726,7 +1079,7 @@ Respond with ONLY a JSON object:
   "findings": "files/components from the facts that look relevant and why",
   "answer": "",
   "workers": [
-    {"task": "specific instruction", "files": "comma-separated file names or scope", "write": false}
+    {"task": "goal for the worker", "files": "comma-separated file names or scope", "write": false}
   ]
 }"""
 
@@ -739,7 +1092,6 @@ Respond with ONLY a JSON object:
             ],
             max_tokens=MAX_OUT_TOKENS,
         )
-        data = self._extract_json(text)
 
         if data:
             self.frame.plan = str(data.get("plan", ""))
@@ -758,10 +1110,7 @@ Respond with ONLY a JSON object:
         if not workers:
             workers = [
                 {
-                    "task": (
-                        "Investigate the repository to address this goal and report "
-                        f"concrete findings: {user_question}"
-                    ),
+                    "task": f"Investigate the repository to address this goal and report concrete findings: {user_question}",
                     "files": "",
                     "write": False,
                 }
@@ -782,20 +1131,21 @@ Respond with ONLY a JSON object:
         return workers
 
     def synthesize(self, round_reports: List[ChildReport]) -> dict:
-        system_prompt = """You are the Orchestrator reviewing child worker reports.
+        system_prompt = """You are the Orchestrator reviewing worker reports.
 
 Decide whether the user's goal is fully satisfied.
 
 Base your judgement only on the reports. Do not assume work happened that the reports do not show.
-If the goal requires file changes and no worker has successfully written them, they are NOT done yet.
-If a write happened, check the report's readback/warnings; if something is wrong, schedule a fix.
-If more information is needed, or edits/fixes/verification remain, schedule workers (same rules: narrow tasks, "write": true only for file modification).
-Pass worker tasks all the specifics they need (exact signatures, paths, package names) because they do not see other reports.
+If the goal requires file changes and no worker reports a successful edit/write, it is NOT done yet.
+If an edit happened, check the report's readback/warnings; if something is wrong, schedule a fix.
+If more information is needed, or edits/fixes/verification remain, schedule workers (same rules: a goal + at most 2 files, "write": true only for file modification).
+If a report has FOLLOW-UP entries that the goal needs, schedule one worker per follow-up file with a precise goal.
+Pass worker goals all the specifics they need (exact names, signatures, package names) because they do not see other reports.
 
 HARD LIMIT: each worker gets at most 2 files. If a task needs more files, split it into several workers.
-Use file paths exactly as shown in the facts (relative to the service folder). Never guess folder names.
+Use file paths exactly as shown in the reports (relative to the service folder). Never guess folder names.
 
-If a worker is INCOMPLETE or PARTIAL, do NOT repeat its task. Split it into smaller tasks of at most 2 files each, using the exact paths from the reports.
+If a worker is INCOMPLETE or PARTIAL, do NOT repeat its task. Split it into smaller goals of at most 2 files each.
 
 Respond with ONLY a JSON object:
 {
@@ -806,7 +1156,7 @@ Respond with ONLY a JSON object:
 Use an empty workers list when status is DONE."""
 
         reports_text = "\n\n".join(
-            f"[{r.worker_id}] ({r.status}) TASK: {r.task}\nREPORT:\n{r.findings}"
+            f"[{r.worker_id}] ({r.status}) GOAL: {r.task}\nREPORT:\n{r.findings}"
             for r in round_reports
         )
         prior = f"PRIOR SYNTHESIS:\n{self.frame.synthesis}\n\n" if self.frame.synthesis else ""
@@ -840,7 +1190,7 @@ Use an empty workers list when status is DONE."""
         print(f"\n[Session saved to: {self.session_file}]")
 
     def load_session(self, path: str = None) -> bool:
-        """Restore a saved session so a new run can continue from it."""
+        """Restore a saved session (manual use only; never called automatically)."""
         p = Path(path or self.session_file)
         if not p.exists():
             return False
@@ -872,7 +1222,7 @@ Use an empty workers list when status is DONE."""
             print(f"[EXECUTION PHASE - Round {rnd}, {len(workers)} worker(s)]")
 
             round_reports = []
-            for i, w in enumerate(workers, 1):
+            for i, w in enumerate(workers, 1):   # sequential: edits to one file never run in parallel
                 report = self.spawn_worker(
                     worker_id=f"W{rnd}.{i}",
                     task=w["task"],
@@ -898,6 +1248,9 @@ Use an empty workers list when status is DONE."""
                 f"{i}. {'[WRITE] ' if w['write'] else ''}{w['task']}"
                 for i, w in enumerate(workers, 1)
             )
+
+        if self._backed_up:
+            self.frame.synthesis += "\n\nACTUAL CHANGES ON DISK (diff vs originals):\n" + self._change_report()
 
         self.frame.awareness_state = "SESSION_SAVED"
         print(self.frame.render())

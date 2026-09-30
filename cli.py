@@ -9,7 +9,7 @@ from agent.developer_agent import DeveloperAgent
 from agent.key_manager import GroqKeyRotator
 from dotenv import load_dotenv      
 
-load_dotenv(Path(__file__).parent / ".env", override=False)   
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True) 
 
 console = Console()
 
@@ -34,7 +34,7 @@ def load_groq_keys() -> list[str]:
 
     # 2. Numbered keys (GROQ_API_KEY_1 ... GROQ_API_KEY_10)
     numbered = []
-    for i in range(1, 11):
+    for i in range(1, 15):
         k = os.getenv(f"GROQ_API_KEY_{i}", "").strip()
         if k:
             numbered.append(k)
