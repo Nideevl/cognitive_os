@@ -11,14 +11,16 @@ from engine.ast_indexer import ASTIndexer
 # ------------------------------------------------------------------ limits
 MAX_TOOL_CHARS = 6000        # cap on grep / list results fed to a navigator
 MAX_SKELETON_CHARS = 30000   # cap per file skeleton
-MAX_CONTEXT_CHARS = 26000    # navigator context budget (older grep/list results get dropped)
+MAX_CONTEXT_CHARS = 16000    # navigator context budget (~4.5k tokens, under the 7k/request model limit)
+MAX_REQUEST_TOKENS = 6000    # _chat shortens old results before sending anything bigger than this
+MAX_FIND_FILES = 40
 MAX_READER_CHARS = 14000     # max code shown to one leaf
 MAX_OUT_TOKENS = 1000        # some keys allow only 1000 output tokens/min
 MAX_WORKER_TURNS = 10
 MAX_ROUNDS = 3
 MAX_WORKERS_PER_ROUND = 8
 MAX_GREP_HITS = 60
-MAX_FILES_PER_WORKER = 2
+MAX_FILES_PER_WORKER = 1      # a level-2 navigator gets exactly one file
 
 TOOL_NAMES = ("skeleton", "read", "refs", "grep", "list_files",
               "edit", "replace_preview", "replace_all")
@@ -29,6 +31,10 @@ WRITE_RE = re.compile(
     re.DOTALL,
 )
 FENCE_RE = re.compile(r"```[\w+-]*[ \t]*\r?\n(.*?)```", re.DOTALL)
+MECHANICAL_RE = re.compile(
+    r"replace_(?:all|preview)|\brename\b|repo-?wide|every occurrence|all occurrences|everywhere",
+    re.IGNORECASE,
+)
 TEXT_EXTS = {".java", ".xml", ".yml", ".yaml", ".properties", ".json", ".gradle", ".md", ".sql"}
 SKIP_DIRS = {"target", "build", ".git", ".idea", "node_modules", ".cognitive_backup"}
 
@@ -165,6 +171,8 @@ class DeveloperAgent:
         self.rotator = key_rotator
         self.model = model
         self.indexer = ASTIndexer()
+        self.token_log: List[dict] = []
+        self._unscheduled: List[str] = []
         self.frame = WorkingFrame()
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
@@ -184,6 +192,8 @@ class DeveloperAgent:
         """Every question starts from zero: no frame, no reports, no synthesis, no target services."""
         self.frame = WorkingFrame()
         self.target_services = set()
+        self.token_log = []
+        self._unscheduled = []
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.backup_root = self._new_backup_root()
@@ -223,7 +233,23 @@ class DeveloperAgent:
         except Exception:
             return str(path)
 
+    @staticmethod
+    def _fit(messages) -> None:
+        """Keep one request under MAX_REQUEST_TOKENS: shorten the oldest tool results first (estimate: 3.2 chars/token)."""
+        limit = int(MAX_REQUEST_TOKENS * 3.2)
+        size = lambda: sum(len(m["content"]) for m in messages)
+        for m in messages[2:]:
+            if size() <= limit:
+                return
+            if m["role"] == "user" and len(m["content"]) > 500:
+                m["content"] = m["content"][:500] + "\n...[shortened to fit the request limit; re-run the tool if needed]"
+        if len(messages) > 2 and size() > limit:   # last resort, navigator turns only: cut the fresh task/skeleton block
+            over = size() - limit
+            m = messages[1]
+            m["content"] = m["content"][: max(2000, len(m["content"]) - over)] + "\n...[skeleton cut to fit the request limit]"
+
     def _chat(self, messages, max_tokens: int = 2000) -> str:
+        self._fit(messages)
         def call(client):
             res = client.chat.completions.create(
                 model=self.model,
@@ -240,6 +266,23 @@ class DeveloperAgent:
         res = self.rotator.execute_with_failover(call)
         text = res.choices[0].message.content or ""
         return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+    def _snap(self) -> Tuple[int, int]:
+        return self.total_prompt_tokens, self.total_completion_tokens
+
+    def _log_tokens(self, label: str, before: Tuple[int, int]):
+        p = self.total_prompt_tokens - before[0]
+        c = self.total_completion_tokens - before[1]
+        self.token_log.append({"label": label, "prompt": p, "completion": c})
+        print(f"[Tokens] {label}: {p + c} (prompt {p} / completion {c})")
+
+    def _token_summary(self):
+        groups: Dict[str, int] = {}
+        for e in self.token_log:
+            lab = e["label"]
+            key = "workers" if lab.startswith("W") else lab.split()[0]
+            groups[key] = groups.get(key, 0) + e["prompt"] + e["completion"]
+        print("[Tokens] by phase: " + " | ".join(f"{k}: {v}" for k, v in groups.items()))
 
     @staticmethod
     def _extract_json(text: str) -> Optional[dict]:
@@ -1025,8 +1068,18 @@ FOLLOW-UP: <one per line 'file | member | why', or NONE>
 
     # -------------------------------------------------- level 1: orchestration
 
-    @staticmethod
-    def _clean_workers(raw) -> List[dict]:
+    def _valid_target(self, f: str, allow_new: bool) -> bool:
+        """A worker target must be a real .java file (write workers may also name a new file in an existing folder)."""
+        p, _ = self._resolve(f)
+        if p is not None:
+            return p.suffix == ".java"
+        if allow_new and f.endswith(".java") and "/" in f:
+            norm = f.replace("\\", "/").lstrip("/")
+            bases = [self.root] + [self.root / sv for sv in sorted(self.target_services)]
+            return any((base / norm).parent.is_dir() for base in bases)
+        return False
+
+    def _clean_workers(self, raw) -> List[dict]:
         workers = []
         if not isinstance(raw, list):
             return workers
@@ -1038,17 +1091,79 @@ FOLLOW-UP: <one per line 'file | member | why', or NONE>
                 files = ", ".join(str(f) for f in files)
             write = bool(w.get("write", False))
             flist = [f.strip() for f in re.split(r"[,\n]", str(files)) if f.strip()]
-            if not write and len(flist) > MAX_FILES_PER_WORKER:
-                for i in range(0, len(flist), MAX_FILES_PER_WORKER):
-                    chunk = flist[i:i + MAX_FILES_PER_WORKER]
+            task_text = str(w["task"])
+            valid = [f for f in flist if self._valid_target(f, write)]
+            dropped = [f for f in flist if f not in valid]
+            if dropped and not MECHANICAL_RE.search(task_text):
+                task_text += f"\n(Scope: {', '.join(dropped)}. Locate the .java files with grep/list_files.)"
+            if len(valid) > MAX_FILES_PER_WORKER:
+                for i in range(0, len(valid), MAX_FILES_PER_WORKER):
+                    chunk = valid[i:i + MAX_FILES_PER_WORKER]
                     workers.append({
-                        "task": f"{w['task']}\n(Focus ONLY on: {', '.join(chunk)}.)",
+                        "task": f"{task_text}\n(Focus ONLY on: {', '.join(chunk)}.)",
                         "files": ", ".join(chunk),
-                        "write": False,
+                        "write": write,
+                        "find": "",
                     })
             else:
-                workers.append({"task": str(w["task"]), "files": str(files), "write": write})
-        return workers[:MAX_WORKERS_PER_ROUND]
+                workers.append({"task": task_text, "files": ", ".join(valid), "write": write,
+                                "find": str(w.get("find", "") or "").strip()})
+        return workers
+
+    def _files_matching(self, pattern: str) -> List[str]:
+        """Code only, no LLM: repo-relative .java files that contain a line matching the regex."""
+        try:
+            rx = re.compile(pattern)
+        except re.error:
+            rx = re.compile(re.escape(pattern))
+        found: List[str] = []
+        for p in sorted(self.root.rglob("*.java")):
+            if self._skip(p):
+                continue
+            try:
+                text = p.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            if any(rx.search(line) for line in text.splitlines()):
+                found.append(self._rel(p))
+                if len(found) >= MAX_FIND_FILES:
+                    break
+        return found
+
+    def _expand_workers(self, workers: List[dict]) -> List[dict]:
+        """Workers without a file but with a `find` regex get one worker per matching file (code-only search)."""
+        self._unscheduled = []
+        out: List[dict] = []
+        for w in workers:
+            if w["files"].strip() or MECHANICAL_RE.search(w["task"]):
+                out.append(w)
+                continue
+            if not w.get("find"):
+                out.append(w)   # nothing to search for: the worker locates its own files with grep/list_files
+                continue
+            found = self._files_matching(w["find"])
+            low = w["task"].lower()
+            # the first service named in the goal is the target; later mentions are usually the pattern to copy
+            named = sorted(
+                (low.index(sv.lower()), sv) for sv in self.list_services() if sv.lower() in low
+            )
+            if named:
+                found = [f for f in found if f.split("/")[0] == named[0][1]]
+            print(f"[Find] /{w['find']}/ -> {len(found)} file(s): {w['task'][:60]!r}")
+            if not found:
+                out.append(w)   # nothing found: the worker keeps its goal and uses grep itself
+                continue
+            for f in found:
+                out.append({"task": f"{w['task']}\n(Focus ONLY on: {f}.)", "files": f, "write": w["write"], "find": ""})
+        for w in out[MAX_WORKERS_PER_ROUND:]:
+            self._unscheduled.append(w["files"] or w["task"][:80])
+        return out[:MAX_WORKERS_PER_ROUND]
+
+    def _set_next_tasks(self, workers: List[dict]):
+        self.frame.next_tasks = "\n".join(
+            f"{i}. {'[WRITE] ' if w['write'] else ''}{w['task']} ({w['files']})"
+            for i, w in enumerate(workers, 1)
+        )
 
     def create_intelligent_plan(self, user_question: str) -> List[dict]:
         self.frame.global_intent = user_question
@@ -1060,16 +1175,16 @@ FOLLOW-UP: <one per line 'file | member | why', or NONE>
 
 Given repository facts and a user goal, produce a plan and delegate work to workers.
 
-Each worker is a NAVIGATOR: it is shown the outline (skeleton with line ranges) of its assigned files and delegates the reading/editing of exact line ranges to tiny single-shot readers/editors. So give a worker a GOAL (what to find out or change) and up to 2 files. Do NOT tell workers to read whole files or to "list all methods"; state the question.
+Each worker is a NAVIGATOR: it is shown the outline (skeleton with line ranges) of its assigned files and delegates the reading/editing of exact line ranges to tiny single-shot readers/editors. So give a worker a GOAL (what to find out or change) and exactly one file (or none: leave "files" empty and set "find" to a regex; the harness greps the repo with it and gives each matching file its own worker). Do NOT tell workers to read whole files or to "list all methods"; state the question.
 Workers can also grep and list files. Grant "write": true only to workers whose goal is to create or modify files, and only if the goal actually requires changes.
 If the goal only asks for analysis or explanation, use read-only workers. If the goal needs changes to files that are named or easy to locate, give WRITE workers the whole job (they read what they need through readers, then edit). Use a separate read-only round only when the edit depends on information from files the writer would not see.
 Do not assume anything about files you have not been shown; have workers verify.
 
-HARD LIMIT: each worker gets at most 2 files. If a task needs more files, split it into several workers.
+HARD LIMIT: each worker gets exactly ONE file. If a task spans more files, leave "files" empty, name the service in the goal and set "find" to a regex matching lines in the files to inspect or change (e.g. "findById|orElseThrow"); the harness greps and gives each matching file its own worker.
 Use file paths exactly as shown in the facts (relative to the service folder). Never guess folder names.
 
 If the facts/overview already answer the goal, return "workers": [] and put the answer in "answer".
-Otherwise use the FEWEST workers possible. For repo-wide questions about a name, package or string, use ONE worker that calls grep. Never list every service.
+Otherwise use the FEWEST workers possible. For work that spans many files use ONE worker entry with "files" empty and a "find" regex. Never list every service.
 Keep the JSON compact: at most 4 workers, each task under 25 words, files as short paths.
 For repo-wide mechanical changes (renaming a package/word, replacing a string everywhere), use ONE write worker that runs replace_preview, then replace_all. Do NOT enumerate files or services.
 
@@ -1079,7 +1194,7 @@ Respond with ONLY a JSON object:
   "findings": "files/components from the facts that look relevant and why",
   "answer": "",
   "workers": [
-    {"task": "goal for the worker", "files": "comma-separated file names or scope", "write": false}
+    {"task": "goal for the worker", "files": "one file name, or empty", "find": "regex or empty", "write": false}
   ]
 }"""
 
@@ -1138,20 +1253,24 @@ Decide whether the user's goal is fully satisfied.
 Base your judgement only on the reports. Do not assume work happened that the reports do not show.
 If the goal requires file changes and no worker reports a successful edit/write, it is NOT done yet.
 If an edit happened, check the report's readback/warnings; if something is wrong, schedule a fix.
-If more information is needed, or edits/fixes/verification remain, schedule workers (same rules: a goal + at most 2 files, "write": true only for file modification).
+If more information is needed, or edits/fixes/verification remain, schedule workers (same rules: a goal + one file, "write": true only for file modification).
 If a report has FOLLOW-UP entries that the goal needs, schedule one worker per follow-up file with a precise goal.
 Pass worker goals all the specifics they need (exact names, signatures, package names) because they do not see other reports.
 
-HARD LIMIT: each worker gets at most 2 files. If a task needs more files, split it into several workers.
+HARD LIMIT: each worker gets exactly ONE file. If a task spans more files, leave "files" empty, name the service in the goal and set "find" to a regex matching lines in the files to inspect or change (e.g. "findById|orElseThrow"); the harness greps and gives each matching file its own worker.
 Use file paths exactly as shown in the reports (relative to the service folder). Never guess folder names.
+The "files" field holds .java file paths only, never a service or folder name.
+Do NOT tell workers to read whole files or to "list all methods"; state the question.
+For work that spans many files use ONE worker entry with "files" empty and a "find" regex. Never list every service.
+Keep the JSON compact: at most 4 workers, each task under 25 words, files as short paths.
 
-If a worker is INCOMPLETE or PARTIAL, do NOT repeat its task. Split it into smaller goals of at most 2 files each.
+If a worker is INCOMPLETE or PARTIAL, do NOT repeat its task. Split it into smaller goals of one file each.
 
 Respond with ONLY a JSON object:
 {
   "summary": "concise factual state: what was found, what was done, what remains",
   "status": "DONE" or "CONTINUE",
-  "workers": [ {"task": "...", "files": "...", "write": false} ]
+  "workers": [ {"task": "...", "files": "...", "find": "", "write": false} ]
 }
 Use an empty workers list when status is DONE."""
 
@@ -1184,6 +1303,7 @@ Use an empty workers list when status is DONE."""
             "frame": self.frame.to_dict(),
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
+            "token_log": self.token_log,
             "session_file": self.session_file,
         }
         Path(self.session_file).write_text(json.dumps(session_data, indent=2), encoding="utf-8")
@@ -1211,11 +1331,16 @@ Use an empty workers list when status is DONE."""
 
     def execute_plan(self, user_question: str) -> str:
         self._reset()
+        t0 = self._snap()
         workers = self.create_intelligent_plan(user_question)
+        self._log_tokens("planning", t0)
         if not workers:
             print(self.frame.render())
             self.save_session()
             return self.frame.synthesis
+
+        workers = self._expand_workers(workers)
+        self._set_next_tasks(workers)
 
         for rnd in range(1, MAX_ROUNDS + 1):
             self.frame.awareness_state = f"EXECUTING_ROUND_{rnd}"
@@ -1223,18 +1348,35 @@ Use an empty workers list when status is DONE."""
 
             round_reports = []
             for i, w in enumerate(workers, 1):   # sequential: edits to one file never run in parallel
+                wid = f"W{rnd}.{i}"
+                t = self._snap()
                 report = self.spawn_worker(
-                    worker_id=f"W{rnd}.{i}",
+                    worker_id=wid,
                     task=w["task"],
                     target_files=w["files"],
                     can_write=w["write"],
                     context=self.frame.synthesis if rnd > 1 else "",
                 )
+                self._log_tokens(wid, t)
                 round_reports.append(report)
+
+            if self._unscheduled:
+                note = ChildReport(
+                    "DISCOVERY",
+                    "files found but not scheduled (round worker limit)",
+                    "FINDINGS: more matching files exist than workers allowed in one round.\n"
+                    "EVIDENCE: NONE\nFOLLOW-UP:\n" + "\n".join(f"{f} | - | not processed yet" for f in self._unscheduled),
+                    "PARTIAL",
+                )
+                round_reports.append(note)
+                self.frame.child_reports.append(note)
+                self._unscheduled = []
 
             self.frame.awareness_state = "SYNTHESIZING"
             print("\n[SYNTHESIS PHASE]\n")
+            t = self._snap()
             decision = self.synthesize(round_reports)
+            self._log_tokens(f"synthesis r{rnd}", t)
             if any(r.status == "COMPLETED" and looks_like_tool_markup(r.findings) for r in round_reports):
                 print("[WARN] a worker's final report is raw tool markup; parsing failed")
 
@@ -1243,17 +1385,15 @@ Use an empty workers list when status is DONE."""
             if rnd == MAX_ROUNDS:
                 self.frame.synthesis += "\n\n[round limit reached; work may remain]"
                 break
-            workers = decision["workers"]
-            self.frame.next_tasks = "\n".join(
-                f"{i}. {'[WRITE] ' if w['write'] else ''}{w['task']}"
-                for i, w in enumerate(workers, 1)
-            )
+            workers = self._expand_workers(decision["workers"])
+            self._set_next_tasks(workers)
 
         if self._backed_up:
             self.frame.synthesis += "\n\nACTUAL CHANGES ON DISK (diff vs originals):\n" + self._change_report()
 
         self.frame.awareness_state = "SESSION_SAVED"
         print(self.frame.render())
+        self._token_summary()
         total = self.total_prompt_tokens + self.total_completion_tokens
         print(
             f"[Telemetry] Prompt: {self.total_prompt_tokens} | "
