@@ -21,9 +21,13 @@ MAX_ROUNDS = 3
 MAX_WORKERS_PER_ROUND = 8
 MAX_GREP_HITS = 60
 MAX_FILES_PER_WORKER = 1      # a level-2 navigator gets exactly one file
+MAX_STATE_CHARS = 1800        # code-built state handed to the next round
+MAX_KNOWN_CHARS = 5000        # KNOWN block inside one navigator
+MAX_FACT_CHARS = 520          # one compact reader fact
+QUOTE_MAX_LINES = 12          # raw lines a navigator may ask for explicitly
 
 TOOL_NAMES = ("skeleton", "read", "refs", "grep", "list_files",
-              "edit", "replace_preview", "replace_all")
+              "edit", "replace_preview", "replace_all", "quote")
 ALIASES = {"get_file_skeleton": "skeleton", "grep_files": "grep"}
 LINE_TOOL_RE = re.compile(r"^\s*(?:[-*]\s*)?TOOL:\s*(\w+)\((.*)\)\s*$", re.MULTILINE)
 WRITE_RE = re.compile(
@@ -41,7 +45,7 @@ SKIP_DIRS = {"target", "build", ".git", ".idea", "node_modules", ".cognitive_bac
 TOOLS_HELP = (
     "Valid tools (one per line, single-line arguments, ' | ' separates parts): "
     "TOOL: skeleton(file) | TOOL: read(file | ranges | question) | TOOL: refs(file | ranges) | "
-    "TOOL: grep(pattern) | TOOL: list_files(dir) | TOOL: edit(file | range | instruction)"
+    "TOOL: quote(file | range) | TOOL: grep(pattern) | TOOL: list_files(dir) | TOOL: edit(file | range | instruction)"
 )
 
 
@@ -62,7 +66,7 @@ def parse_tool_calls(msg: str, limit: int = 4):
 
     if looks_like_tool_markup(msg):
         # native markup or a missing ')' : accept  read(a | b | c  /  edit(a | b | c)
-        for m in re.finditer(r"\b(read|refs|edit|replace_preview|replace_all)\(([^\n<]*)", msg):
+        for m in re.finditer(r"\b(read|refs|quote|edit|replace_preview|replace_all)\(([^\n<]*)", msg):
             arg = m.group(2).strip()
             if arg.endswith(")"):
                 arg = arg[:-1].strip()
@@ -173,6 +177,10 @@ class DeveloperAgent:
         self.indexer = ASTIndexer()
         self.token_log: List[dict] = []
         self._unscheduled: List[str] = []
+        self._state_lines: List[str] = []
+        self._applied: List[str] = []
+        self._held: Dict[str, str] = {}
+        self._worker_file: Dict[str, str] = {}
         self.frame = WorkingFrame()
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
@@ -194,6 +202,10 @@ class DeveloperAgent:
         self.target_services = set()
         self.token_log = []
         self._unscheduled = []
+        self._state_lines = []
+        self._applied = []
+        self._held = {}
+        self._worker_file = {}
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.backup_root = self._new_backup_root()
@@ -541,27 +553,33 @@ class DeveloperAgent:
         ctx = self._class_context(path, ranges)
 
         system_prompt = (
-            "You are a code reader. You see ONLY the line ranges below, taken from one file. "
-            "You cannot see the rest of the file and you have no tools.\n"
-            "Answer the QUESTION strictly from the code shown. Never guess about code you cannot see.\n"
-            "Reply in exactly this format and nothing else:\n"
-            "ANSWER: <direct, concise answer>\n"
-            "EVIDENCE: <up to 8 lines, each 'LINE: code' copied from the shown code>\n"
-            "LEADS: <methods/types/classes the code uses that are defined elsewhere, as 'name (line N)'; or NONE>\n"
-            "COVERAGE: FOUND IN RANGE | NOT IN RANGE (say what is missing)"
+            "You are a code reader. You see ONLY the line ranges below (one file) and have no tools. "
+            "Answer the QUESTION strictly from the shown code; never guess about unseen code.\n"
+            "Reply in exactly these 4 lines:\n"
+            "ANSWER: <max 25 words>\n"
+            "AT: <line numbers that prove it, e.g. 55,57-58, or NONE>\n"
+            "LEADS: <things the code uses that are defined elsewhere, as 'name (line N)', or NONE>\n"
+            "COV: FOUND | NOT_IN_RANGE <max 10 words on what is missing>"
         )
         user = f"FILE: {rel}\nQUESTION: {parts[2]}\n\nCODE (line-number prefixes are not part of the code):\n{code}"
         if ctx:
-            user += ("\n\nCLASS CONTEXT (declarations elsewhere in the file that the code refers to; "
+            user += (f"\n\nCLASS CONTEXT (declarations elsewhere in the file that the code refers to; "
                      f"NOT part of your ranges):\n{ctx}")
         answer = self._chat(
             [{"role": "system", "content": system_prompt}, {"role": "user", "content": user}],
             max_tokens=MAX_OUT_TOKENS,
         )
         if not answer or looks_like_tool_markup(answer):
-            answer = "ANSWER: (reader produced no usable answer)\nCOVERAGE: UNKNOWN"
-        spans = ", ".join(f"{a}-{b}" for a, b in ranges)
-        return f"[reader {rel} lines {spans}]\n{answer}"
+            answer = "ANSWER: (reader produced no usable answer)\nCOV: UNKNOWN"
+        fields = {m.group(1): m.group(2).strip()
+                  for m in re.finditer(r"^(ANSWER|AT|LEADS|COV):\s*(.*)$", answer, re.MULTILINE)}
+        if "ANSWER" not in fields:
+            fields = {"ANSWER": self._flat(answer, 200)}
+        at = self._valid_at(fields.get("AT", "NONE"), ranges)
+        spans = ",".join(f"{a}-{b}" for a, b in ranges)
+        line = (f"§READ {rel} L{spans} | ANSWER: {fields['ANSWER']} | AT: {at} | "
+                f"LEADS: {fields.get('LEADS', 'NONE')} | COV: {fields.get('COV', 'UNKNOWN')}")
+        return self._flat(line, MAX_FACT_CHARS)
 
     def tool_refs(self, arg: str) -> str:
         """Deterministic usage map for line ranges (no LLM)."""
@@ -580,6 +598,28 @@ class DeveloperAgent:
         ctx = self._class_context(path, ranges)
         spans = ", ".join(f"{a}-{b}" for a, b in ranges)
         return f"[refs {self._rel(path)} lines {spans}]\n" + (ctx or "(no references to other members of this file)")
+
+    def tool_quote(self, arg: str) -> str:
+        """Deterministic raw-lines view for a navigator that explicitly needs a few lines (max QUOTE_MAX_LINES)."""
+        parts = [p.strip().strip("'\"") for p in arg.split("|", 1)]
+        if len(parts) < 2 or not parts[1]:
+            return "ERROR: use quote(file | range)   e.g. quote(A.java | 55-58)"
+        path, err = self._resolve(parts[0])
+        if err:
+            return err
+        try:
+            lines, _ = self._read_lines(path)
+        except Exception as e:
+            return f"Error reading file: {e}"
+        n = self._n(lines)
+        ranges = self._parse_ranges(parts[1], n)
+        if len(ranges) != 1:
+            return "ERROR: quote needs exactly one range, e.g. quote(A.java | 55-58)"
+        a, b = ranges[0]
+        if b - a + 1 > QUOTE_MAX_LINES:
+            b = a + QUOTE_MAX_LINES - 1
+        body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(a, b + 1))
+        return f"[quote {self._rel(path)} {a}-{b}]\n{body}"
 
     def tool_edit(self, arg: str) -> str:
         """Level-3 WRITER: replaces exactly one line range. Harness applies + validates + reports."""
@@ -607,7 +647,6 @@ class DeveloperAgent:
 
         code = self._cap(self._numbered(lines, [(a, b)], rel), MAX_READER_CHARS)
         ctx = self._class_context(path, [(a, b)])
-        skel = self._cap(self.indexer.generate_skeleton(path), 12000) if is_java else ""
 
         system_prompt = (
             f"You are a code editor. Replace EXACTLY lines {a}-{b} of the file with new text.\n"
@@ -619,8 +658,6 @@ class DeveloperAgent:
         user = f"FILE: {rel}\nINSTRUCTION: {parts[2]}\n\nLINES TO REPLACE:\n{code}"
         if ctx:
             user += f"\n\nCLASS CONTEXT (elsewhere in the file, do not output these):\n{ctx}"
-        if skel:
-            user += f"\n\nFILE OUTLINE (for reference, do not output):\n{skel}"
 
         msg = self._chat(
             [{"role": "system", "content": system_prompt}, {"role": "user", "content": user}],
@@ -670,11 +707,6 @@ class DeveloperAgent:
                 report.append("REMOVED outline entries:\n" + "\n".join(f"  {s}" for s in removed[:10]))
             if delta:
                 report.append(f"Everything after line {b} moved by {delta:+d}. The CURRENT SKELETONS block already reflects this.")
-        new_n = self._n(new_lines)
-        s2, e2 = a, min(new_n, a + max(len(body_lines), 1) - 1)
-        if body_lines:
-            preview = "\n".join(f"{i}: {new_lines[i - 1]}" for i in range(s2, min(e2, s2 + 60) + 1))
-            report.append(f"READBACK:\n{preview}")
         return "\n".join(report)
 
     # ------------------------------------------------------- whole-file writes
@@ -898,6 +930,8 @@ class DeveloperAgent:
             return self.tool_read(arg), False
         if name == "refs":
             return self.tool_refs(arg), False
+        if name == "quote":
+            return self.tool_quote(arg), False
         if name == "grep":
             return self.grep_files(arg), False
         if name == "list_files":
@@ -911,6 +945,73 @@ class DeveloperAgent:
             return res, not res.startswith(("ERROR", "REJECTED"))
         return f"Unknown tool: {name}. {TOOLS_HELP}", False
 
+    # ---------------------------------------------------------- compact protocol
+
+    @staticmethod
+    def _flat(text: str, cap: int) -> str:
+        t = re.sub(r"\s+", " ", text).strip()
+        return t if len(t) <= cap else t[: cap - 3] + "..."
+
+    @staticmethod
+    def _valid_at(at_text: str, ranges) -> str:
+        """Keep only claimed line numbers that lie inside the ranges the reader was shown."""
+        keep, claimed = [], False
+        for tok in re.split(r"[,\s]+", at_text.strip()):
+            m = re.fullmatch(r"(\d+)(?:-(\d+))?", tok)
+            if not m:
+                continue
+            claimed = True
+            lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+            if any(a <= lo and hi <= b for a, b in ranges):
+                keep.append(tok)
+        if keep:
+            return ",".join(keep)
+        return "INVALID" if claimed else "NONE"
+
+    @staticmethod
+    def _parse_report(text: str) -> dict:
+        lines = [l.strip() for l in text.splitlines() if l.strip().startswith("§")]
+        status, verdicts = None, []
+        for l in lines:
+            m = re.match(r"§STATUS\s+(DONE|HELD|FAIL)\b", l)
+            if m:
+                status = m.group(1)
+            m = re.match(r"§A\s*(\d+)\s+([YN?])", l)
+            if m:
+                verdicts.append((int(m.group(1)), m.group(2)))
+        return {"status": status, "lines": lines, "verdicts": verdicts}
+
+    def _records(self, r) -> List[str]:
+        """Compact record lines of one report (what the next round and the orchestrator get)."""
+        rep = self._parse_report(r.findings)
+        head = f"§R {r.worker_id} {r.status} {self._worker_file.get(r.worker_id, '') or '-'}"
+        body = [l for l in rep["lines"] if not l.startswith("§STATUS")]
+        if not rep["lines"]:
+            body = ["§FACT (unstructured) " + self._flat(r.findings, 300)]
+        acts = re.search(r"ACTIONS:\s*(.+)", r.findings)
+        if acts:
+            body.append("§ACTIONS " + self._flat(acts.group(1), 300))
+        return [head] + body
+
+    @staticmethod
+    def _flat_lines(lines: List[str], cap: int) -> str:
+        text = "\n".join(lines)
+        return text if len(text) <= cap else text[: cap - 3] + "..."
+
+    def _state_block(self) -> str:
+        lines = list(self._state_lines)
+        while len("\n".join(lines)) > MAX_STATE_CHARS and len(lines) > 1:
+            lines.pop(0)
+        return "\n".join(lines)
+
+    def _final_block(self) -> str:
+        out = []
+        if self._applied:
+            out.append(f"§APPLIED {len(self._applied)}: " + "; ".join(self._applied))
+        for f, q in self._held.items():
+            out.append(f"§HELD {f}: {q}")
+        return "\n".join(out)
+
     def spawn_worker(
         self,
         worker_id: str,
@@ -918,52 +1019,53 @@ class DeveloperAgent:
         target_files: str = "",
         can_write: bool = False,
         context: str = "",
+        expect: str = "",
     ) -> ChildReport:
         print(f"\n[Stack Push -> {worker_id}]{' (write)' if can_write else ''}")
         print(f"  Task: {task}")
+        if expect:
+            print(f"  Expect: {expect}")
+        self._worker_file[worker_id] = (target_files or "").strip()
 
         write_doc = ""
         if can_write:
             write_doc = """
-- TOOL: edit(file | range | instruction)   (a level-3 editor replaces EXACTLY that one contiguous range; use the range from the CURRENT skeleton; the harness rejects edits that break the syntax)
-- TOOL: replace_preview(old => new)   (repo-wide literal replace, DRY RUN: counts per file type, writes nothing)
-- TOOL: replace_all(old => new)   (repo-wide literal replace in java/xml/yml/properties/json files; backs up originals; run replace_preview first and check the counts)
-- To create a NEW or EMPTY file, reply with EXACTLY this and nothing else:
+TOOL: edit(file | range | instruction)  (a level-3 editor replaces EXACTLY that one contiguous range; use ranges from the CURRENT skeleton; syntax-breaking edits are rejected)
+TOOL: replace_preview(old => new)  (repo-wide literal replace, dry run)
+TOOL: replace_all(old => new)  (repo-wide literal replace in java/xml/yml/properties/json; backs up originals; preview first)
+New or empty file: reply with EXACTLY this and nothing else:
 WRITE_FILE: <repo-relative path>
 ```java
 <full file content>
 ```
-Editing rules: to insert a new member, edit the range of a neighbouring member and tell the editor to keep it and add the new member after it. To add an import, edit the import range. After each edit the skeleton updates automatically; verify important edits with read(...)."""
+To add a member, edit a neighbouring member's range and tell the editor to keep it and add the new one after it. To add an import, edit the import range. The skeleton updates after each edit.
+WRITE RULE: edit only if every EXPECT item is Y and the edit achieves the GOAL as far as your file shows. If any is N or ?, make NO edit and report §STATUS HELD with a §Q."""
 
-        system_prompt = f"""You are Worker {worker_id}, a level-2 NAVIGATOR inside a code repository. You plan; you do not read code yourself.
+        system_prompt = f"""You are {worker_id}, a level-2 NAVIGATOR. You see the SKELETON (member line ranges) of your file. You plan; you never read code yourself.
+Skeleton facts (names, signatures, annotations) you may state. Behaviour and imports need a reader. Lombok/Spring may generate members that are not in the source. Say "not in this file" only after the skeleton covered the whole file.
+KNOWN lists what your earlier tool calls established; never ask the same thing twice.
+TOOLS (max 4 per message, one per line, ' | ' separates parts, written exactly as TOOL: name(arg), no XML):
+TOOL: read(file | ranges | question)  (a level-3 reader sees ONLY those lines, answers, is discarded; one precise question, smallest ranges)
+TOOL: refs(file | ranges)  (fields/methods those lines use)
+TOOL: quote(file | range)  (raw lines, max {QUOTE_MAX_LINES}; only when a reader answer is not enough)
+TOOL: grep(pattern)
+TOOL: list_files(directory)
+TOOL: skeleton(file){write_doc}
+If the answer needs another file, do not chase it: report a §Q. Do only the goal.
+FINAL REPLY (no tool call), records only, one per line:
+§STATUS DONE|HELD|FAIL
+§A <n> Y|N|? <line numbers or max 12 words>   (one per EXPECT item)
+§FACT <max 25 words> @<file>:L<lines>   (confirmed facts, max 8)
+§Q <question> -> <file>   (for every N or ? that another file can settle)
+§SCOPE <files you actually examined>   (a "not found" claim holds only inside this scope)
+§FOLLOW <file> | <member> | <why>"""
 
-You are shown the SKELETON of your files: an outline with the line range of every member (annotations included). Imports are folded into one range. Lombok/Spring annotations can generate members that are not in the source, so never conclude "no constructor/getter" from the skeleton alone.
-To learn what code does, delegate to a level-3 reader: read(file | ranges | question). The reader sees ONLY those lines, answers your question, and is then discarded. Ask one precise question per read; give the smallest ranges that contain the answer; include the ranges of fields/constants the code uses (or call refs first).
-To inspect imports, read the import range with a specific question (e.g. which package does X come from?).
-Facts visible in the skeleton (member names, signatures, annotations, class/interface/enum) you may state directly. Behaviour and imports need a reader.
-Say "not in this file" only after the skeleton has covered the whole file.
-If the trail leaves your files (something defined elsewhere), do NOT chase it: report it as FOLLOW-UP.
-
-TOOLS (up to 4 per message, one per line, single-line arguments, ' | ' separates parts):
-- TOOL: read(file | ranges | question)   (ranges like 10-20, 40-45 or 'all')
-- TOOL: refs(file | ranges)   (deterministic: fields/methods of this file that those lines use, with their ranges)
-- TOOL: skeleton(file)   (add another .java file's skeleton to your view)
-- TOOL: grep(pattern)   (regex or literal; returns path:line: text)
-- TOOL: list_files(directory){write_doc}
-
-RULES:
-- Do only the assigned goal. Delegate the minimum reading needed.
-- Base every claim on the skeleton or on reader answers; if something is unknown, say so.
-- Finish with a report and NO tool call, in this format:
-FINDINGS: <concise answer to your goal / what you changed>
-EVIDENCE: <'file:line: code' lines that prove it>
-FOLLOW-UP: <one per line 'file | member | why', or NONE>
-- Tool calls must be written exactly as TOOL: name(arg). Do not use XML/<tool_call> tags."""
-
-        base_user = f"ASSIGNED FILES/SCOPE: {target_files or '(not specified)'}\n"
+        base_user = f"FILE/SCOPE: {target_files or '(not specified)'}\n"
         if context:
-            base_user += f"\nCONTEXT FROM ORCHESTRATOR:\n{context}\n"
+            base_user += f"\nSTATE FROM EARLIER ROUNDS:\n{context}\n"
         base_user += f"\nGOAL: {task}"
+        if expect:
+            base_user += f"\nEXPECT (verify each, answer with §A): {expect}"
 
         known: List[Path] = []
         for f in re.split(r"[,\n]", target_files or ""):
@@ -975,25 +1077,41 @@ FOLLOW-UP: <one per line 'file | member | why', or NONE>
                 known.append(p)
         known = known[:4]
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": base_user},
-        ]
-
+        known_facts: List[str] = []
+        last = ""
         actions: List[str] = []
         final = ""
         finished = False
         partial = False
+        edits_made = False
         seen = set()
         parse_fails = 0
+        turn_tokens: List[int] = []
+
+        def user_block(extra: str = "") -> str:
+            facts = list(known_facts)
+            while len("\n".join(facts)) > MAX_KNOWN_CHARS and len(facts) > 1:
+                idx = next((i for i, f in enumerate(facts) if not f.startswith("§EDIT")), 0)
+                facts.pop(idx)
+            u = base_user + self._skeleton_block(known)
+            if facts:
+                u += "\n\nKNOWN (already established):\n" + "\n".join(facts)
+            if extra:
+                u += "\n\n" + extra
+            return u
 
         for _ in range(MAX_WORKER_TURNS):
-            messages[1]["content"] = base_user + self._skeleton_block(known)   # always fresh
-            if self._trim_history(messages):
-                seen.clear()
+            # every turn is a fresh call rebuilt from state: no transcript is carried over
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_block(last)},
+            ]
+            before = self._snap()
             msg = self._chat(messages, max_tokens=MAX_OUT_TOKENS)
-            messages.append({"role": "assistant", "content": msg})
+            after = self._snap()
+            turn_tokens.append((after[0] - before[0]) + (after[1] - before[1]))
             final = msg
+            last = ""
 
             w = WRITE_RE.search(msg)
             if w:
@@ -1001,34 +1119,43 @@ FOLLOW-UP: <one per line 'file | member | why', or NONE>
                     result = self.write_file(w.group(1), w.group(2))
                     actions.append(result.split("\n")[0])
                     if result.startswith("WROTE"):
+                        edits_made = True
                         seen.clear()
                         p, _err = self._resolve(w.group(1), fuzzy=False)
                         if p is not None and p.suffix == ".java" and p not in known:
                             known.append(p)
                 else:
                     result = "ERROR: you do not have write permission."
-                messages.append({"role": "user", "content": f"RESULTS:\n{result}"})
+                known_facts.append("§WRITE " + self._flat(result, 200))
                 continue
 
             calls = parse_tool_calls(msg)
             if calls:
                 parse_fails = 0
-                outs, keep = [], False
+                raw_outs = []
                 for name, arg in calls:
                     key = (name, arg.lower())
                     if key in seen:
-                        outs.append(f"[{name}({arg})] already returned above; do not repeat it.")
+                        raw_outs.append(f"[{name}] already in KNOWN or shown above; do not repeat it.")
                         continue
                     seen.add(key)
                     result, mutated = self._dispatch(name, arg, can_write, known)
-                    if name in ("read", "refs", "edit", "replace_all"):
-                        keep = True
                     if mutated:
                         seen.clear()
+                        edits_made = True
                         actions.append(result.split("\n")[0][:160])
-                    outs.append(f"[{name}({arg})]\n{result}")
-                prefix = "RESULTS:\n" if keep else "TOOL RESULT:\n"
-                messages.append({"role": "user", "content": prefix + "\n\n".join(outs)})
+                    if name == "read":
+                        known_facts.append(result if result.startswith("§READ") else "§READ " + self._flat(result, 400))
+                    elif name == "refs":
+                        known_facts.append(f"§REFS {arg}: " + self._flat(result, 600))
+                    elif name in ("edit", "replace_all"):
+                        known_facts.append("§EDIT " + self._flat(result, 450))
+                    elif name == "skeleton":
+                        known_facts.append("§SKEL " + self._flat(result, 120))
+                    else:
+                        raw_outs.append(f"[{name}({arg})]\n{result}")
+                if raw_outs:
+                    last = "RESULT OF YOUR LAST TOOL CALL (shown once):\n" + "\n\n".join(raw_outs)
                 continue
 
             if looks_like_tool_markup(msg):
@@ -1036,34 +1163,66 @@ FOLLOW-UP: <one per line 'file | member | why', or NONE>
                 if parse_fails >= 3:
                     break   # stop burning tokens; go to the forced wrap-up report
                 ex = self._rel(known[0]).rsplit("/", 1)[-1] if known else "File.java"
-                messages.append({"role": "user", "content":
-                    "TOOL ERROR: could not parse that call. Write ONE line per call, starting with 'TOOL:' "
-                    f"and ending with ')', no XML tags. Example: TOOL: read({ex} | 10-20 | what does this code throw?)"})
+                last = ("TOOL ERROR: could not parse that call. Write ONE line per call, starting with 'TOOL:' "
+                        f"and ending with ')', no XML tags. Example: TOOL: read({ex} | 10-20 | what does this code throw?)")
                 continue
 
             finished = True
             break
 
         if not finished:
-            # budget exhausted: force a report from what was already learned
-            messages.append({"role": "user", "content":
-                "Tool budget exhausted. Write your final report NOW from what you already learned, "
-                "in the FINDINGS / EVIDENCE / FOLLOW-UP format. NO tool calls."})
-            msg = self._chat(messages, max_tokens=MAX_OUT_TOKENS)
+            wrap = "Tool budget exhausted. Write your final records NOW from KNOWN. NO tool calls."
+            msg = self._chat(
+                [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_block(wrap)}],
+                max_tokens=MAX_OUT_TOKENS,
+            )
             if msg and not looks_like_tool_markup(msg):
-                final = msg + "\n\n[partial: turn budget hit]"
+                final = msg
                 partial = True
             else:
                 final += "\n\n[worker hit turn limit before finishing]"
 
-        status = "COMPLETED" if finished else ("PARTIAL" if partial else "INCOMPLETE")
-        if actions:
-            final += "\n\nACTIONS: " + "; ".join(actions)
+        rep = self._parse_report(final)
+        body = "\n".join(rep["lines"]) if rep["lines"] else final
+        warns = []
+        if can_write and edits_made and (rep["status"] == "HELD" or any(v != "Y" for _n, v in rep["verdicts"])):
+            warns.append("§WARN edit was made although an EXPECT item was not Y")
+        if can_write and rep["status"] == "DONE" and not edits_made and not MECHANICAL_RE.search(task):
+            warns.append("§WARN status DONE but no edit was applied")
+        if partial:
+            warns.append("§WARN partial: turn budget hit")
+        if warns:
+            body += "\n" + "\n".join(warns)
 
-        report = ChildReport(worker_id, task, final, status)
+        if rep["status"] == "HELD":
+            status = "HELD"
+        elif rep["status"] == "FAIL":
+            status = "INCOMPLETE"
+        elif finished:
+            status = "COMPLETED"
+        elif partial:
+            status = "PARTIAL"
+        else:
+            status = "INCOMPLETE"
+
+        if actions:
+            body += "\n\nACTIONS: " + "; ".join(actions)
+            self._applied.extend(self._flat(a, 160) for a in actions if a.startswith(("EDITED", "WROTE", "APPLIED")))
+
+        fkey = self._worker_file.get(worker_id) or worker_id
+        if status == "HELD":
+            qs = [l for l in rep["lines"] if l.startswith("§Q")]
+            self._held[fkey] = " ".join(qs) if qs else "(no question given)"
+        elif status == "COMPLETED":
+            self._held.pop(fkey, None)
+
+        print(f"[Turns] {worker_id}: " + " ".join(str(t) for t in turn_tokens))
+        self.token_log.append({"label": f"{worker_id} turns", "prompt": 0, "completion": 0, "turns": turn_tokens})
+
+        report = ChildReport(worker_id, task, body, status)
         self.frame.child_reports.append(report)
         print(f"[Stack Pop <- {worker_id}]")
-        print(f"  Findings: {final[:300]}...\n")
+        print(f"  Findings: {body[:300]}...\n")
         return report
 
     # -------------------------------------------------- level 1: orchestration
@@ -1092,6 +1251,10 @@ FOLLOW-UP: <one per line 'file | member | why', or NONE>
             write = bool(w.get("write", False))
             flist = [f.strip() for f in re.split(r"[,\n]", str(files)) if f.strip()]
             task_text = str(w["task"])
+            expect = w.get("expect", "")
+            if isinstance(expect, list):
+                expect = " | ".join(str(x) for x in expect)
+            expect = str(expect or "").strip()[:600]
             valid = [f for f in flist if self._valid_target(f, write)]
             dropped = [f for f in flist if f not in valid]
             if dropped and not MECHANICAL_RE.search(task_text):
@@ -1104,10 +1267,11 @@ FOLLOW-UP: <one per line 'file | member | why', or NONE>
                         "files": ", ".join(chunk),
                         "write": write,
                         "find": "",
+                        "expect": expect,
                     })
             else:
                 workers.append({"task": task_text, "files": ", ".join(valid), "write": write,
-                                "find": str(w.get("find", "") or "").strip()})
+                                "find": str(w.get("find", "") or "").strip(), "expect": expect})
         return workers
 
     def _files_matching(self, pattern: str) -> List[str]:
@@ -1154,7 +1318,8 @@ FOLLOW-UP: <one per line 'file | member | why', or NONE>
                 out.append(w)   # nothing found: the worker keeps its goal and uses grep itself
                 continue
             for f in found:
-                out.append({"task": f"{w['task']}\n(Focus ONLY on: {f}.)", "files": f, "write": w["write"], "find": ""})
+                out.append({"task": f"{w['task']}\n(Focus ONLY on: {f}.)", "files": f, "write": w["write"],
+                            "find": "", "expect": w.get("expect", "")})
         for w in out[MAX_WORKERS_PER_ROUND:]:
             self._unscheduled.append(w["files"] or w["task"][:80])
         return out[:MAX_WORKERS_PER_ROUND]
@@ -1171,30 +1336,22 @@ FOLLOW-UP: <one per line 'file | member | why', or NONE>
 
         topology = self._extract_topology_facts(user_question)
 
-        system_prompt = """You are the Orchestrator (level 1) of a multi-agent developer system working on a code repository.
+        system_prompt = """You are the Orchestrator (level 1) of a multi-agent developer system working on a code repository. Given repository facts and a user goal, produce a plan and delegate.
 
-Given repository facts and a user goal, produce a plan and delegate work to workers.
-
-Each worker is a NAVIGATOR: it is shown the outline (skeleton with line ranges) of its assigned files and delegates the reading/editing of exact line ranges to tiny single-shot readers/editors. So give a worker a GOAL (what to find out or change) and exactly one file (or none: leave "files" empty and set "find" to a regex; the harness greps the repo with it and gives each matching file its own worker). Do NOT tell workers to read whole files or to "list all methods"; state the question.
-Workers can also grep and list files. Grant "write": true only to workers whose goal is to create or modify files, and only if the goal actually requires changes.
-If the goal only asks for analysis or explanation, use read-only workers. If the goal needs changes to files that are named or easy to locate, give WRITE workers the whole job (they read what they need through readers, then edit). Use a separate read-only round only when the edit depends on information from files the writer would not see.
-Do not assume anything about files you have not been shown; have workers verify.
-
-HARD LIMIT: each worker gets exactly ONE file. If a task spans more files, leave "files" empty, name the service in the goal and set "find" to a regex matching lines in the files to inspect or change (e.g. "findById|orElseThrow"); the harness greps and gives each matching file its own worker.
-Use file paths exactly as shown in the facts (relative to the service folder). Never guess folder names.
-
-If the facts/overview already answer the goal, return "workers": [] and put the answer in "answer".
-Otherwise use the FEWEST workers possible. For work that spans many files use ONE worker entry with "files" empty and a "find" regex. Never list every service.
-Keep the JSON compact: at most 4 workers, each task under 25 words, files as short paths.
-For repo-wide mechanical changes (renaming a package/word, replacing a string everywhere), use ONE write worker that runs replace_preview, then replace_all. Do NOT enumerate files or services.
+Workers are NAVIGATORS. Each sees only the outline (member line ranges) of ONE file and delegates reading/editing of exact line ranges to tiny readers/editors. A worker cannot see other files or other workers' reports.
+Give each worker: "task" = the GOAL including the intent (what must be true afterwards); "files" = exactly one file; "expect" = what you assume about that file, as numbered claims (A1, A2, ...). The worker verifies every claim and edits only if all hold; if one is wrong, or depends on another file, it makes NO edit and reports back and you re-plan.
+Work that spans many files: ONE worker entry with "files" empty and "find" = a regex matching lines in the files to inspect or change (e.g. "findById|orElseThrow"); name the service in the task. The harness greps and gives each matching file its own worker. "files" never holds a service or folder name. Never list every service.
+Repo-wide mechanical changes (rename a package/word, replace a string everywhere): ONE write worker that runs replace_preview then replace_all; no files, no expect.
+"write": true only for workers that must modify files; analysis-only goals use read-only workers. If an edit depends on facts in other files (what a method throws, a class's package or constructor), first schedule one-file read-only workers for those files, then the write workers.
+Do not assume anything about files you have not been shown. Use the FEWEST workers: at most 4, each task under 25 words, file paths as shown in the facts (relative to the service folder). If the facts already answer the goal, return "workers": [] and put the answer in "answer".
 
 Respond with ONLY a JSON object:
 {
   "plan": "2-3 sentence strategy",
-  "findings": "files/components from the facts that look relevant and why",
+  "findings": "relevant files/components from the facts and why",
   "answer": "",
   "workers": [
-    {"task": "goal for the worker", "files": "one file name, or empty", "find": "regex or empty", "write": false}
+    {"task": "goal + intent", "files": "one file or empty", "find": "regex or empty", "expect": ["A1 ...", "A2 ..."], "write": false}
   ]
 }"""
 
@@ -1228,6 +1385,8 @@ Respond with ONLY a JSON object:
                     "task": f"Investigate the repository to address this goal and report concrete findings: {user_question}",
                     "files": "",
                     "write": False,
+                    "find": "",
+                    "expect": "",
                 }
             ]
 
@@ -1248,34 +1407,24 @@ Respond with ONLY a JSON object:
     def synthesize(self, round_reports: List[ChildReport]) -> dict:
         system_prompt = """You are the Orchestrator reviewing worker reports.
 
-Decide whether the user's goal is fully satisfied.
+Reports are compact records: §STATUS DONE|HELD|FAIL; §A <n> Y|N|? (verdict on your EXPECT item n); §FACT; §Q <question> -> <file>; §SCOPE (a "not found" claim holds only inside that scope); §FOLLOW; §ACTIONS (edits the harness applied); §WARN.
+Judge only from the reports; do not assume work happened that they do not show. If the goal needs file changes and no report shows an applied edit, it is not done.
+HELD means the worker made NO edit. For each §Q schedule a one-file read-only worker on the file it names with a precise question; in a later round re-issue the write worker with corrected "expect". A §WARN about an edit made despite an unmet EXPECT: schedule a worker to check that file.
+Workers do not see other reports: put every specific they need (names, signatures, package names, message convention) in the task or expect.
+Limits: ONE file per worker; for work spanning many files leave "files" empty and set "find" (regex); never a service or folder name in "files"; at most 4 workers; each task under 25 words; paths exactly as in the reports. Never repeat a PARTIAL/INCOMPLETE task: split it into one-file goals.
 
-Base your judgement only on the reports. Do not assume work happened that the reports do not show.
-If the goal requires file changes and no worker reports a successful edit/write, it is NOT done yet.
-If an edit happened, check the report's readback/warnings; if something is wrong, schedule a fix.
-If more information is needed, or edits/fixes/verification remain, schedule workers (same rules: a goal + one file, "write": true only for file modification).
-If a report has FOLLOW-UP entries that the goal needs, schedule one worker per follow-up file with a precise goal.
-Pass worker goals all the specifics they need (exact names, signatures, package names) because they do not see other reports.
-
-HARD LIMIT: each worker gets exactly ONE file. If a task spans more files, leave "files" empty, name the service in the goal and set "find" to a regex matching lines in the files to inspect or change (e.g. "findById|orElseThrow"); the harness greps and gives each matching file its own worker.
-Use file paths exactly as shown in the reports (relative to the service folder). Never guess folder names.
-The "files" field holds .java file paths only, never a service or folder name.
-Do NOT tell workers to read whole files or to "list all methods"; state the question.
-For work that spans many files use ONE worker entry with "files" empty and a "find" regex. Never list every service.
-Keep the JSON compact: at most 4 workers, each task under 25 words, files as short paths.
-
-If a worker is INCOMPLETE or PARTIAL, do NOT repeat its task. Split it into smaller goals of one file each.
+When status is DONE, "summary" is the final answer for the user: confirmed results, what was changed, anything HELD with its question. Compact lines, no filler.
 
 Respond with ONLY a JSON object:
 {
-  "summary": "concise factual state: what was found, what was done, what remains",
+  "summary": "state: found / done / remaining",
   "status": "DONE" or "CONTINUE",
-  "workers": [ {"task": "...", "files": "...", "find": "", "write": false} ]
+  "workers": [ {"task": "...", "files": "...", "find": "", "expect": [], "write": false} ]
 }
 Use an empty workers list when status is DONE."""
 
         reports_text = "\n\n".join(
-            f"[{r.worker_id}] ({r.status}) GOAL: {r.task}\nREPORT:\n{r.findings}"
+            f"[{r.worker_id}] ({r.status}) GOAL: {r.task}\n" + self._flat_lines(self._records(r), 1500)
             for r in round_reports
         )
         prior = f"PRIOR SYNTHESIS:\n{self.frame.synthesis}\n\n" if self.frame.synthesis else ""
@@ -1355,7 +1504,8 @@ Use an empty workers list when status is DONE."""
                     task=w["task"],
                     target_files=w["files"],
                     can_write=w["write"],
-                    context=self.frame.synthesis if rnd > 1 else "",
+                    context=self._state_block() if rnd > 1 else "",
+                    expect=str(w.get("expect", "") or ""),
                 )
                 self._log_tokens(wid, t)
                 round_reports.append(report)
@@ -1364,13 +1514,16 @@ Use an empty workers list when status is DONE."""
                 note = ChildReport(
                     "DISCOVERY",
                     "files found but not scheduled (round worker limit)",
-                    "FINDINGS: more matching files exist than workers allowed in one round.\n"
-                    "EVIDENCE: NONE\nFOLLOW-UP:\n" + "\n".join(f"{f} | - | not processed yet" for f in self._unscheduled),
+                    "\n".join(f"§FOLLOW {f} | - | matched the search but exceeded the round limit"
+                              for f in self._unscheduled),
                     "PARTIAL",
                 )
                 round_reports.append(note)
                 self.frame.child_reports.append(note)
                 self._unscheduled = []
+
+            for r in round_reports:
+                self._state_lines.extend(self._records(r))
 
             self.frame.awareness_state = "SYNTHESIZING"
             print("\n[SYNTHESIS PHASE]\n")
@@ -1388,6 +1541,9 @@ Use an empty workers list when status is DONE."""
             workers = self._expand_workers(decision["workers"])
             self._set_next_tasks(workers)
 
+        final_block = self._final_block()
+        if final_block:
+            self.frame.synthesis += "\n\n" + final_block
         if self._backed_up:
             self.frame.synthesis += "\n\nACTUAL CHANGES ON DISK (diff vs originals):\n" + self._change_report()
 
